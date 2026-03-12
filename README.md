@@ -1,14 +1,115 @@
-# astrbot-plugin-helloworld
+# Skills & MCP 管理器 (astrbot_plugin_skills_mcp_manager)
 
-AstrBot 插件模板 / A template plugin for AstrBot plugin feature
+为astrbot提供函数工具和指令来管理 AstrBot Skills 和 MCP 服务器。
 
-> [!NOTE]
-> This repo is just a template of [AstrBot](https://github.com/AstrBotDevs/AstrBot) Plugin.
-> 
-> [AstrBot](https://github.com/AstrBotDevs/AstrBot) is an agentic assistant for both personal and group conversations. It can be deployed across dozens of mainstream instant messaging platforms, including QQ, Telegram, Feishu, DingTalk, Slack, LINE, Discord, Matrix, etc. In addition, it provides a reliable and extensible conversational AI infrastructure for individuals, developers, and teams. Whether you need a personal AI companion, an intelligent customer support agent, an automation assistant, or an enterprise knowledge base, AstrBot enables you to quickly build AI applications directly within your existing messaging workflows.
+## 环境要求
 
-# Supports
+| 依赖 | 版本要求 | 说明 |
+|------|----------|------|
+| Python | >= 3.10 | |
+| AstrBot | >= 4.13.2 | Skills + MCP 管理 API |
 
-- [AstrBot Repo](https://github.com/AstrBotDevs/AstrBot)
-- [AstrBot Plugin Development Docs (Chinese)](https://docs.astrbot.app/dev/star/plugin-new.html)
-- [AstrBot Plugin Development Docs (English)](https://docs.astrbot.app/en/dev/star/plugin-new.html)
+## 功能
+
+- 16 个 LLM Tool — 供 LLM 自动调用的函数工具，覆盖 Skills 和 MCP 全生命周期管理
+- `/skill` 命令组 — 用户直接通过指令管理 Skills
+- `/mcp` 命令组 — 用户直接通过指令管理 MCP 服务器
+- 内置 Skill — 自动安装 `SKILL.md` 指令手册，引导 AI 正确使用管理工具
+
+## 安装
+
+1. 在 AstrBot 插件市场搜索 `Skills & MCP 管理器` 或手动克隆到 `data/plugins/` 目录
+2. 重启 AstrBot 即可自动加载，无需额外配置
+
+## LLM 工具列表
+
+### Skills 管理
+
+| 工具 | 功能 | 权限 |
+|------|------|------|
+| `list_skills` | 列出所有 Skills 及状态 | 无 |
+| `enable_skill` | 启用 Skill | 管理员 |
+| `disable_skill` | 禁用 Skill | 管理员 |
+| `delete_skill` | 删除 Skill（需确认） | 管理员 |
+| `install_skill` | 从 ZIP 安装 Skill | 管理员 |
+| `list_skill_files` | 列出 Skill 文件结构 | 无 |
+| `read_skill_file` | 读取 Skill 文件内容 | 无 |
+| `update_skill_file` | 更新 Skill 文件内容 | 管理员 |
+| `update_skill_from_zip` | 从 ZIP 覆盖更新 Skill（需确认） | 管理员 |
+
+### MCP 服务器管理
+
+| 工具 | 功能 | 权限 |
+|------|------|------|
+| `list_mcp_servers` | 列出 MCP 服务器及运行状态 | 无 |
+| `get_mcp_server_config` | 查看配置详情（自动脱敏） | 无 |
+| `enable_mcp_server` | 启用 MCP 服务器 | 管理员 |
+| `disable_mcp_server` | 禁用 MCP 服务器 | 管理员 |
+| `add_mcp_server` | 添加 MCP 服务器（自动测试连接） | 管理员 |
+| `update_mcp_server` | 更新配置（测试→禁用→保存→启用） | 管理员 |
+| `remove_mcp_server` | 移除 MCP 服务器（需确认） | 管理员 |
+
+## 使用
+
+### 指令
+
+```
+/skill ls              # 列出 Skills
+/skill on  <名称>      # 启用 Skill
+/skill off <名称>      # 禁用 Skill
+/skill del <名称>      # 删除 Skill
+/skill files <名称>    # 查看文件结构
+/skill read <名称> <文件>  # 读取文件
+/skill install         # 交互式安装（发送 ZIP）
+/skill update <名称>   # 交互式更新（发送 ZIP/文件）
+
+/mcp ls                # 列出 MCP 服务器
+/mcp config <名称>     # 查看配置详情
+/mcp on  <名称>        # 启用
+/mcp off <名称>        # 禁用
+/mcp del <名称>        # 删除
+/mcp add <名称>        # 交互式添加（发送 JSON 配置）
+/mcp update <名称>     # 交互式更新（发送 JSON 配置）
+```
+
+### LLM Tool
+
+当 LLM 需要管理 Skills 或 MCP 服务器时，会自动调用对应的管理工具。例如用户说「帮我添加一个 arxiv 搜索服务」，AI 会调用 `add_mcp_server`。
+
+### 安全设计
+
+- **管理员校验**: 所有修改操作通过 `event.role` 验证
+- **名称校验**: 名称必须匹配 `^[A-Za-z0-9._-]+$`，防止路径注入
+- **路径安全**: 文件读写有目录越权检查
+- **二次确认**: 破坏性操作需 `confirm=true` 参数
+- **配置脱敏**: 展示 MCP 配置时自动隐藏 API Key / Token
+- **回滚机制**: MCP 添加失败时自动回滚配置
+
+## 项目结构
+
+```
+astrbot_plugin_skills_mcp_manager/
+├── main.py                          # 插件入口 (Star 类)
+├── metadata.yaml                    # 插件元数据
+├── README.md
+├── tools/
+│   ├── __init__.py                  # 工具导出
+│   ├── skill_tools.py               # 9 个 Skills 管理 FunctionTool
+│   └── mcp_tools.py                 # 7 个 MCP 管理 FunctionTool
+└── skills/
+    └── skills-mcp-manager/
+        └── SKILL.md                 # 内置 AI 指令手册
+```
+
+## 支持
+
+- [AstrBot 插件开发文档](https://docs.astrbot.app/dev/star/plugin-new.html)
+- [Issues](https://github.com/piexian/astrbot_plugin_skills_mcp_manager/issues)
+
+## 🔗 相关链接
+
+- [AstrBot](https://docs.astrbot.app/)
+
+## 许可
+
+AGPL-3.0 License
