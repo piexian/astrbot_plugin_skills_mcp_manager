@@ -18,8 +18,9 @@
 
 ## 安装
 
-1. 在 AstrBot 插件市场搜索 `Skills & MCP 管理器` 或手动克隆到 `data/plugins/` 目录
-2. 重启 AstrBot 即可自动加载，无需额外配置
+1. 在 AstrBot 插件市场搜索 `Skills & MCP 管理器` 
+2. 在插件界面右下角点击加号选择从链接安装输入 ` https://github.com/piexian/astrbot_plugin_skills_mcp_manager  `
+
 
 ## LLM 工具列表
 
