@@ -18,6 +18,8 @@
 
 ## 安装
 
+### 俩种方式
+
 1. 在 AstrBot 插件市场搜索 `Skills & MCP 管理器` 
 2. 在插件界面右下角点击加号选择从链接安装输入 ` https://github.com/piexian/astrbot_plugin_skills_mcp_manager  `
 
