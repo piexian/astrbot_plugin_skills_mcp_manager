@@ -11,7 +11,7 @@ import re
 import shutil
 from pathlib import Path
 
-from astrbot.api import logger, star
+from astrbot.api import AstrBotConfig, logger, star
 from astrbot.api.event import AstrMessageEvent, MessageEventResult, filter
 from astrbot.core.skills.skill_manager import SkillManager
 from astrbot.core.utils.session_waiter import SessionController, session_waiter
@@ -60,9 +60,16 @@ _SENSITIVE_KEYS = frozenset(
 class Main(star.Star):
     """Skills & MCP Manager Plugin"""
 
-    def __init__(self, context: star.Context) -> None:
+    def __init__(self, context: star.Context, config: AstrBotConfig) -> None:
         super().__init__(context)
         self.context = context
+        self.config = config
+
+        # Read diff mode settings
+        diff_mode = bool(config.get("diff_mode", False))
+        diff_threshold = int(config.get("diff_match_threshold", 100))
+        # Clamp to valid range [50, 100]
+        diff_threshold = max(50, min(100, diff_threshold))
 
         # Install builtin skill
         self._install_builtin_skill()
@@ -77,7 +84,10 @@ class Main(star.Star):
             InstallSkillTool(),
             ListSkillFilesTool(),
             ReadSkillFileTool(),
-            UpdateSkillFileTool(),
+            UpdateSkillFileTool(
+                diff_mode=diff_mode,
+                diff_match_threshold=diff_threshold,
+            ),
             UpdateSkillFromZipTool(),
             # MCP tools
             ListMcpServersTool(),
@@ -85,7 +95,10 @@ class Main(star.Star):
             EnableMcpServerTool(),
             DisableMcpServerTool(),
             AddMcpServerTool(),
-            UpdateMcpServerTool(),
+            UpdateMcpServerTool(
+                diff_mode=diff_mode,
+                diff_match_threshold=diff_threshold,
+            ),
             RemoveMcpServerTool(),
         )
 
@@ -242,13 +255,23 @@ class Main(star.Star):
         if not name:
             event.set_result(MessageEventResult().message("用法: /skill files <名称>"))
             return
+        if not _SKILL_NAME_RE.fullmatch(name):
+            event.set_result(MessageEventResult().message(f"❌ 无效名称: {name}"))
+            return
 
         mgr = SkillManager()
         skills_root = Path(mgr.skills_root)
-        skill_dir = skills_root / name
+        skill_dir = (skills_root / name).resolve()
 
         if not skill_dir.exists():
             event.set_result(MessageEventResult().message(f"❌ Skill 不存在: {name}"))
+            return
+
+        # Security check: ensure skill_dir is within skills_root
+        try:
+            skill_dir.relative_to(skills_root.resolve())
+        except ValueError:
+            event.set_result(MessageEventResult().message("❌ 非法路径"))
             return
 
         lines = [f"📁 Skill {name} 文件结构:\n"]
@@ -277,14 +300,18 @@ class Main(star.Star):
                 MessageEventResult().message("用法: /skill read <名称> <文件路径>")
             )
             return
+        if not _SKILL_NAME_RE.fullmatch(name):
+            event.set_result(MessageEventResult().message(f"❌ 无效名称: {name}"))
+            return
 
         mgr = SkillManager()
         skills_root = Path(mgr.skills_root)
-        file_path = (skills_root / name / file).resolve()
+        skill_dir = (skills_root / name).resolve()
+        file_path = (skill_dir / file).resolve()
 
-        # Security check
+        # Security check: constrain to the specific skill directory
         try:
-            file_path.relative_to(skills_root.resolve())
+            file_path.relative_to(skill_dir)
         except ValueError:
             event.set_result(MessageEventResult().message("❌ 非法文件路径"))
             return
@@ -399,10 +426,13 @@ class Main(star.Star):
         if not name:
             event.set_result(MessageEventResult().message("用法: /skill update <名称>"))
             return
+        if not _SKILL_NAME_RE.fullmatch(name):
+            event.set_result(MessageEventResult().message(f"❌ 无效名称: {name}"))
+            return
 
         mgr = SkillManager()
         skills_root = Path(mgr.skills_root)
-        skill_dir = skills_root / name
+        skill_dir = (skills_root / name).resolve()
 
         if not skill_dir.exists():
             event.set_result(
@@ -460,7 +490,16 @@ class Main(star.Star):
                                 )
                             )
                         else:
-                            dest_path = skill_dir / file_name
+                            dest_path = (skill_dir / file_name).resolve()
+                            # Security check: ensure path stays within skill dir
+                            try:
+                                dest_path.relative_to(skill_dir)
+                            except ValueError:
+                                errors.append((file_name, "非法文件名: 路径逃逸"))
+                                await event.send(
+                                    event.plain_result(f"❌ {file_name}: 非法文件名")
+                                )
+                                continue
                             dest_path.parent.mkdir(parents=True, exist_ok=True)
                             shutil.copy(file_path_str, dest_path)
                             updated_files.append((file_name, "已更新"))
@@ -552,11 +591,14 @@ class Main(star.Star):
                 return
 
             server_config = servers[name]
+
+            # Connect first, then persist on success
+            await tool_mgr.enable_mcp_server(name, server_config, timeout=30)
+
             server_config["active"] = True
             config["mcpServers"][name] = server_config
             tool_mgr.save_mcp_config(config)
 
-            await tool_mgr.enable_mcp_server(name, server_config, timeout=30)
             event.set_result(
                 MessageEventResult().message(
                     f"✅ 已启用 MCP: {name}\n💡 提示: 下一次对话生效"
@@ -589,11 +631,12 @@ class Main(star.Star):
                 )
                 return
 
-            servers[name]["active"] = False
-            tool_mgr.save_mcp_config(config)
-
+            # Stop runtime first, then persist on success
             if name in tool_mgr.mcp_server_runtime_view:
                 await tool_mgr.disable_mcp_server(name, timeout=10)
+
+            servers[name]["active"] = False
+            tool_mgr.save_mcp_config(config)
 
             event.set_result(
                 MessageEventResult().message(
@@ -773,7 +816,14 @@ class Main(star.Star):
                     )
                 )
             except Exception as e:
-                await event.send(event.plain_result(f"❌ 启用失败: {e}"))
+                # Rollback: remove the saved config entry
+                try:
+                    rollback_config = tool_mgr.load_mcp_config()
+                    rollback_config.get("mcpServers", {}).pop(name, None)
+                    tool_mgr.save_mcp_config(rollback_config)
+                except Exception:
+                    pass
+                await event.send(event.plain_result(f"❌ 启用失败，已回滚配置: {e}"))
 
             controller.stop()
 
@@ -915,11 +965,21 @@ def _validate_and_update_from_zip(
         import tempfile
 
         with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir).resolve()
+
+            # Zip Slip protection: validate all member paths before extraction
+            for member in zf.namelist():
+                member_target = (tmp_path / member).resolve()
+                if (
+                    not str(member_target).startswith(str(tmp_path) + os.sep)
+                    and member_target != tmp_path
+                ):
+                    raise ValueError(f"ZIP 包含非法路径: {member}")
+
             zf.extractall(tmp_dir)
             src_dir = Path(tmp_dir) / zip_skill_name
 
             # Clear and copy
-            file_count = 0
             for item in skill_dir.iterdir():
                 if item.is_dir():
                     shutil.rmtree(item)
@@ -930,7 +990,9 @@ def _validate_and_update_from_zip(
                     shutil.copytree(item, skill_dir / item.name)
                 else:
                     shutil.copy2(item, skill_dir / item.name)
-                file_count += 1
+
+            # Count actual files (recursive)
+            file_count = sum(1 for f in src_dir.rglob("*") if f.is_file())
             return file_count
 
 

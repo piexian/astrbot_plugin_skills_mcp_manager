@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -12,7 +13,9 @@ from astrbot.api import FunctionTool, logger
 from astrbot.core.agent.run_context import ContextWrapper
 from astrbot.core.agent.tool import ToolExecResult
 from astrbot.core.astr_agent_context import AstrAgentContext
-from astrbot.core.skills.skill_manager import SkillManager, _SKILL_NAME_RE
+from astrbot.core.skills.skill_manager import SkillManager
+
+_SKILL_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 _REFRESH_HINT = (
     "提示: 本次会话工具集为快照，变更需下一次请求生效；请发送一条新消息刷新。"
@@ -398,11 +401,15 @@ class ReadSkillFileTool(FunctionTool):
         try:
             mgr = _get_skill_manager()
             skills_root = Path(mgr.skills_root)
-            target = (skills_root / skill_name / file_path).resolve()
+            skill_dir = (skills_root / skill_name).resolve()
+            target = (skill_dir / file_path).resolve()
 
-            # Security check: ensure path stays within skill directory
-            if not str(target).startswith(str(skills_root.resolve())):
-                return _err("非法文件路径: 不允许访问 skills 目录外的文件。")
+            # Security check: ensure path stays within the specific skill directory
+            try:
+                target.relative_to(skill_dir)
+            except ValueError:
+                return _err("非法文件路径: 不允许访问该 Skill 目录外的文件。")
+
             if not target.exists():
                 return _err(f"文件不存在: {file_path}")
             if not target.is_file():
@@ -427,35 +434,75 @@ class ReadSkillFileTool(FunctionTool):
 # UpdateSkillFileTool
 # ---------------------------------------------------------------------------
 
+_FULL_REPLACE_DESC = (
+    "更新指定 Skill 中的文件内容（全文覆盖模式）。需要管理员权限。用于修改 SKILL.md 或脚本文件。"
+    "传入完整的文件内容以覆盖目标文件。"
+)
+_FULL_REPLACE_PARAMS: dict = {
+    "type": "object",
+    "properties": {
+        "skill_name": {
+            "type": "string",
+            "description": "Skill 名称",
+        },
+        "file_path": {
+            "type": "string",
+            "description": "相对文件路径（如 SKILL.md, scripts/run.sh）",
+        },
+        "content": {
+            "type": "string",
+            "description": "完整的文件内容",
+        },
+    },
+    "required": ["skill_name", "file_path", "content"],
+}
+
+_DIFF_DESC = (
+    "更新指定 Skill 中的文件内容（Diff 模式）。需要管理员权限。"
+    "请提供要替换的原始文本片段和替换后的文本。"
+    "系统会在文件中查找原始文本并验证匹配度，匹配成功后执行替换。"
+    "文件必须已存在。"
+)
+_DIFF_PARAMS: dict = {
+    "type": "object",
+    "properties": {
+        "skill_name": {
+            "type": "string",
+            "description": "Skill 名称",
+        },
+        "file_path": {
+            "type": "string",
+            "description": "相对文件路径（如 SKILL.md, scripts/run.sh）",
+        },
+        "target_content": {
+            "type": "string",
+            "description": "要替换的原始文本片段（需与文件中的内容匹配）",
+        },
+        "replacement_content": {
+            "type": "string",
+            "description": "替换后的新文本",
+        },
+    },
+    "required": ["skill_name", "file_path", "target_content", "replacement_content"],
+}
+
 
 @dataclass
 class UpdateSkillFileTool(FunctionTool):
     """Update the content of a file in a specified Skill."""
 
     name: str = "update_skill_file"
-    description: str = (
-        "更新指定 Skill 中的文件内容。需要管理员权限。用于修改 SKILL.md 或脚本文件。"
-    )
-    parameters: dict = field(
-        default_factory=lambda: {
-            "type": "object",
-            "properties": {
-                "skill_name": {
-                    "type": "string",
-                    "description": "Skill 名称",
-                },
-                "file_path": {
-                    "type": "string",
-                    "description": "相对文件路径（如 SKILL.md, scripts/run.sh）",
-                },
-                "content": {
-                    "type": "string",
-                    "description": "文件内容",
-                },
-            },
-            "required": ["skill_name", "file_path", "content"],
-        }
-    )
+    description: str = _FULL_REPLACE_DESC
+    parameters: dict = field(default_factory=lambda: _FULL_REPLACE_PARAMS.copy())
+
+    # Diff mode settings (injected at init time from plugin config)
+    diff_mode: bool = False
+    diff_match_threshold: int = 100
+
+    def __post_init__(self) -> None:
+        if self.diff_mode:
+            self.description = _DIFF_DESC
+            self.parameters = _DIFF_PARAMS.copy()
 
     async def call(
         self,
@@ -463,6 +510,8 @@ class UpdateSkillFileTool(FunctionTool):
         skill_name: str = "",
         file_path: str = "",
         content: str = "",
+        target_content: str = "",
+        replacement_content: str = "",
         **kwargs: Any,
     ) -> ToolExecResult:
         if err := _ensure_admin(context):
@@ -475,22 +524,122 @@ class UpdateSkillFileTool(FunctionTool):
         try:
             mgr = _get_skill_manager()
             skills_root = Path(mgr.skills_root)
-            target = (skills_root / skill_name / file_path).resolve()
+            skill_dir = (skills_root / skill_name).resolve()
 
-            # Security check
-            if not str(target).startswith(str(skills_root.resolve())):
-                return _err("非法文件路径: 不允许写入 skills 目录外的文件。")
-
-            skill_dir = skills_root / skill_name
             if not skill_dir.exists():
                 return _err(f"Skill 不存在: {skill_name}")
 
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(content, encoding="utf-8")
-            return _ok(message=f"已更新文件: {skill_name}/{file_path}。{_REFRESH_HINT}")
+            target = (skill_dir / file_path).resolve()
+
+            # Security check: ensure path stays within the specific skill directory
+            try:
+                target.relative_to(skill_dir)
+            except ValueError:
+                return _err("非法文件路径: 不允许写入该 Skill 目录外的文件。")
+
+            if self.diff_mode:
+                return self._apply_diff(
+                    target, skill_name, file_path, target_content, replacement_content
+                )
+            else:
+                return self._apply_full_replace(target, skill_name, file_path, content)
         except Exception as e:
             logger.error(f"update_skill_file failed: {e}")
             return _err(str(e))
+
+    def _apply_full_replace(
+        self, target: Path, skill_name: str, file_path: str, content: str
+    ) -> str:
+        """Full file replacement mode."""
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        return _ok(message=f"已更新文件: {skill_name}/{file_path}。{_REFRESH_HINT}")
+
+    def _apply_diff(
+        self,
+        target: Path,
+        skill_name: str,
+        file_path: str,
+        target_content: str,
+        replacement_content: str,
+    ) -> str:
+        """Diff-based replacement mode with match validation."""
+        import difflib
+
+        if not target_content:
+            return _err("target_content 不能为空。")
+
+        if not target.exists():
+            return _err(
+                f"文件不存在: {file_path}。Diff 模式不支持创建新文件，请使用全文模式。"
+            )
+
+        file_text = target.read_text(encoding="utf-8")
+        threshold = self.diff_match_threshold / 100.0
+
+        # Try exact match first (fast path)
+        if target_content in file_text:
+            new_text = file_text.replace(target_content, replacement_content, 1)
+            target.write_text(new_text, encoding="utf-8")
+            return _ok(
+                data={"match_ratio": 100},
+                message=(
+                    f"已更新文件: {skill_name}/{file_path}（精确匹配）。{_REFRESH_HINT}"
+                ),
+            )
+
+        # Fuzzy match using SequenceMatcher
+        best_ratio = 0.0
+        best_start = 0
+        best_end = 0
+        target_len = len(target_content)
+
+        # Sliding window: search for the best matching substring
+        # Use SequenceMatcher to find the best match position
+        sm = difflib.SequenceMatcher(None, file_text, target_content, autojunk=False)
+        blocks = sm.get_matching_blocks()
+
+        # Try windows around each matching block anchor
+        for block in blocks:
+            if block.size == 0:
+                continue
+            # Try different window sizes around this anchor
+            anchor_start = block.a
+            for offset in range(
+                -target_len, target_len // 2 + 1, max(1, target_len // 20)
+            ):
+                start = max(0, anchor_start + offset)
+                end = min(len(file_text), start + target_len)
+                if end - start < target_len // 2:
+                    continue
+                candidate = file_text[start:end]
+                ratio = difflib.SequenceMatcher(
+                    None, candidate, target_content, autojunk=False
+                ).ratio()
+                if ratio > best_ratio:
+                    best_ratio = ratio
+                    best_start = start
+                    best_end = end
+
+        match_pct = int(best_ratio * 100)
+
+        if best_ratio < threshold:
+            return _err(
+                f"匹配失败: 最佳匹配度 {match_pct}%，"
+                f"要求 {self.diff_match_threshold}%。"
+                f"请检查 target_content 是否与文件内容一致。"
+            )
+
+        # Apply replacement
+        new_text = file_text[:best_start] + replacement_content + file_text[best_end:]
+        target.write_text(new_text, encoding="utf-8")
+        return _ok(
+            data={"match_ratio": match_pct},
+            message=(
+                f"已更新文件: {skill_name}/{file_path}"
+                f"（匹配度: {match_pct}%）。{_REFRESH_HINT}"
+            ),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -555,6 +704,18 @@ class UpdateSkillFromZipTool(FunctionTool):
 
             # Use install_skill_from_zip with overwrite=True
             installed_name = mgr.install_skill_from_zip(zip_path, overwrite=True)
+
+            # Verify the ZIP contained the expected skill
+            if installed_name != skill_name:
+                # Rollback: the ZIP installed to a different skill directory
+                try:
+                    mgr.delete_skill(installed_name)
+                except Exception:
+                    pass
+                return _err(
+                    f"ZIP 内 Skill 名 '{installed_name}' 与目标 '{skill_name}' 不一致，已回滚。"
+                )
+
             return _ok(
                 data={"skill_name": installed_name},
                 message=f"已从 ZIP 更新 Skill: {installed_name}。{_REFRESH_HINT}",

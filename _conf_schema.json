@@ -1,0 +1,19 @@
+{
+  "diff_mode": {
+    "description": "编辑模式",
+    "type": "bool",
+    "default": true,
+    "hint": "启用后，AI 编辑 Skill 文件和 MCP 配置时需要提供原始文本和替换文本的 diff 对，而非完整内容。可防止 AI 意外覆盖整个文件或配置。"
+  },
+  "diff_match_threshold": {
+    "description": "文本匹配阈值",
+    "type": "int",
+    "default": 100,
+    "hint": "原始文本匹配度百分比。100 表示必须完全匹配，较低值允许 AI 提供的原始文本有少量偏差。仅在 Diff 模式启用时生效。",
+    "slider": {
+      "min": 50,
+      "max": 100,
+      "step": 1
+    }
+  }
+}
