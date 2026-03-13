@@ -34,7 +34,7 @@
 | `install_skill` | 从 ZIP 安装 Skill | 管理员 |
 | `list_skill_files` | 列出 Skill 文件结构 | 无 |
 | `read_skill_file` | 读取 Skill 文件内容 | 无 |
-| `update_skill_file` | 更新 Skill 文件内容（支持 Diff 模式） | 管理员 |
+| `update_skill_file` | 更新 Skill 文件内容（支持编辑模式） | 管理员 |
 | `update_skill_from_zip` | 从 ZIP 覆盖更新 Skill（需确认） | 管理员 |
 
 ### MCP 服务器管理
@@ -46,7 +46,7 @@
 | `enable_mcp_server` | 启用 MCP 服务器 | 管理员 |
 | `disable_mcp_server` | 禁用 MCP 服务器 | 管理员 |
 | `add_mcp_server` | 添加 MCP 服务器（自动测试连接） | 管理员 |
-| `update_mcp_server` | 更新配置（支持 Diff 模式，测试→禁用→保存→启用） | 管理员 |
+| `update_mcp_server` | 更新配置（支持编辑模式，测试→禁用→保存→启用） | 管理员 |
 | `remove_mcp_server` | 移除 MCP 服务器（需确认） | 管理员 |
 
 ## 使用
@@ -86,7 +86,7 @@
 - **回滚机制**: MCP 添加/启用失败时自动回滚配置
 - **状态一致性**: MCP 启用/禁用操作先执行再保存，避免配置态与运行态不一致
 - **Zip Slip 防护**: ZIP 解压前验证所有成员路径
-- **Diff 模式**: 可选的 diff 编辑模式，AI 只能修改指定文本片段，防止意外覆盖整个文件
+- **编辑模式**: 可选的 diff 编辑模式，AI 只能修改指定文本片段，防止意外覆盖整个文件
 
 ## 配置
 
@@ -94,7 +94,7 @@
 
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
-| `diff_mode` | bool | `false` | 启用 Diff 模式：AI 编辑文件/配置时需提供原始文本和替换文本 |
+| `diff_mode` | bool | `true` | 启用编辑模式：AI 编辑文件/配置时需提供原始文本和替换文本 |
 | `diff_match_threshold` | int (滑块 50-100) | `100` | Diff 匹配阈值百分比，100 = 必须完全匹配 |
 
 ## 项目结构
