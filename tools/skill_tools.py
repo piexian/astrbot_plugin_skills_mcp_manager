@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -14,8 +15,9 @@ from astrbot.core.agent.run_context import ContextWrapper
 from astrbot.core.agent.tool import ToolExecResult
 from astrbot.core.astr_agent_context import AstrAgentContext
 from astrbot.core.skills.skill_manager import SkillManager
+from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
 
-_SKILL_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+_SKILL_NAME_RE = re.compile(r"^[\w.-]+$")
 
 _REFRESH_HINT = (
     "提示: 本次会话工具集为快照，变更需下一次请求生效；请发送一条新消息刷新。"
@@ -66,6 +68,55 @@ def _get_skill_manager() -> SkillManager:
     return SkillManager()
 
 
+def _detect_runtime(context: ContextWrapper[AstrAgentContext]) -> str:
+    """Detect current computer_use_runtime from config."""
+    try:
+        cfg = context.context.context.get_config(
+            umo=context.context.event.unified_msg_origin
+        )
+        return cfg.get("provider_settings", {}).get("computer_use_runtime", "local")
+    except Exception:
+        return "local"
+
+
+def _try_sync_to_sandboxes() -> None:
+    """Best-effort sync skills to active sandboxes after install."""
+    try:
+        import asyncio
+
+        from astrbot.core.computer.computer_client import (
+            sync_skills_to_active_sandboxes,
+        )
+
+        asyncio.ensure_future(sync_skills_to_active_sandboxes())
+    except Exception:
+        pass
+
+
+async def _resolve_zip_path(
+    zip_path: str, context: ContextWrapper[AstrAgentContext]
+) -> tuple[str, str | None]:
+    """Resolve a ZIP path, downloading from sandbox if needed.
+
+    Returns:
+        (actual_local_path, tmp_file_or_none)
+        If tmp_file is not None, caller must clean it up.
+    """
+    if os.path.exists(zip_path):
+        return zip_path, None
+
+    # Path doesn't exist locally — try downloading from sandbox
+    from astrbot.core.computer.computer_client import get_booter
+
+    session_id = context.context.event.unified_msg_origin
+    booter = await get_booter(context.context.context, session_id)
+    tmp_dir = get_astrbot_temp_path()
+    os.makedirs(tmp_dir, exist_ok=True)
+    tmp_file = os.path.join(tmp_dir, f"skill_install_{uuid.uuid4().hex[:8]}.zip")
+    await booter.download_file(zip_path, tmp_file)
+    return tmp_file, tmp_file
+
+
 # ---------------------------------------------------------------------------
 # ListSkillsTool
 # ---------------------------------------------------------------------------
@@ -90,7 +141,8 @@ class ListSkillsTool(FunctionTool):
     ) -> ToolExecResult:
         try:
             mgr = _get_skill_manager()
-            skills = mgr.list_skills()
+            runtime = _detect_runtime(context)
+            skills = mgr.list_skills(runtime=runtime)
             result = [
                 {
                     "name": s.name,
@@ -260,7 +312,8 @@ class InstallSkillTool(FunctionTool):
     name: str = "install_skill"
     description: str = (
         "从 ZIP 文件安装 Skill。需要管理员权限。"
-        "ZIP 文件路径应为本地绝对路径，必须包含单个顶层文件夹和 SKILL.md 文件。"
+        "ZIP 可包含单个顶层文件夹或在根目录直接包含 SKILL.md。"
+        "路径可以是本地绝对路径或沙盒路径（自动下载）。"
     )
     parameters: dict = field(
         default_factory=lambda: {
@@ -268,8 +321,12 @@ class InstallSkillTool(FunctionTool):
             "properties": {
                 "zip_path": {
                     "type": "string",
-                    "description": "ZIP 文件的本地绝对路径",
-                }
+                    "description": "ZIP 文件路径（本地绝对路径或沙盒路径）",
+                },
+                "skill_name_hint": {
+                    "type": "string",
+                    "description": "可选，指定安装后的 Skill 名称（覆盖 ZIP 内目录名）",
+                },
             },
             "required": ["zip_path"],
         }
@@ -279,22 +336,46 @@ class InstallSkillTool(FunctionTool):
         self,
         context: ContextWrapper[AstrAgentContext],
         zip_path: str = "",
+        skill_name_hint: str = "",
         **kwargs: Any,
     ) -> ToolExecResult:
         if err := _ensure_admin(context):
             return err
         if not zip_path:
             return _err("zip_path 不能为空。")
+
+        tmp_file: str | None = None
         try:
+            actual_zip_path, tmp_file = await _resolve_zip_path(zip_path, context)
             mgr = _get_skill_manager()
-            skill_name = mgr.install_skill_from_zip(zip_path)
+            install_kwargs: dict[str, Any] = {}
+            if skill_name_hint:
+                install_kwargs["skill_name_hint"] = skill_name_hint
+            try:
+                skill_name = mgr.install_skill_from_zip(
+                    actual_zip_path, **install_kwargs
+                )
+            except TypeError:
+                # Backward compatibility: older SkillManager without skill_name_hint
+                skill_name = mgr.install_skill_from_zip(actual_zip_path)
+            _try_sync_to_sandboxes()
             return _ok(
                 data={"skill_name": skill_name},
                 message=f"Skill 安装成功: {skill_name}。{_REFRESH_HINT}",
             )
+        except FileExistsError:
+            return _err(
+                "同名 Skill 已存在，请先删除或使用 update_skill_from_zip 更新。"
+            )
         except Exception as e:
             logger.error(f"install_skill failed: {e}")
             return _err(str(e))
+        finally:
+            if tmp_file and os.path.exists(tmp_file):
+                try:
+                    os.remove(tmp_file)
+                except OSError:
+                    pass
 
 
 # ---------------------------------------------------------------------------
@@ -693,7 +774,9 @@ class UpdateSkillFromZipTool(FunctionTool):
         if not zip_path:
             return _err("zip_path 不能为空。")
 
+        tmp_file: str | None = None
         try:
+            actual_zip_path, tmp_file = await _resolve_zip_path(zip_path, context)
             mgr = _get_skill_manager()
             skills_root = Path(mgr.skills_root)
             skill_dir = skills_root / skill_name
@@ -703,7 +786,7 @@ class UpdateSkillFromZipTool(FunctionTool):
                 )
 
             # Use install_skill_from_zip with overwrite=True
-            installed_name = mgr.install_skill_from_zip(zip_path, overwrite=True)
+            installed_name = mgr.install_skill_from_zip(actual_zip_path, overwrite=True)
 
             # Verify the ZIP contained the expected skill
             if installed_name != skill_name:
@@ -716,6 +799,7 @@ class UpdateSkillFromZipTool(FunctionTool):
                     f"ZIP 内 Skill 名 '{installed_name}' 与目标 '{skill_name}' 不一致，已回滚。"
                 )
 
+            _try_sync_to_sandboxes()
             return _ok(
                 data={"skill_name": installed_name},
                 message=f"已从 ZIP 更新 Skill: {installed_name}。{_REFRESH_HINT}",
@@ -723,3 +807,9 @@ class UpdateSkillFromZipTool(FunctionTool):
         except Exception as e:
             logger.error(f"update_skill_from_zip failed: {e}")
             return _err(str(e))
+        finally:
+            if tmp_file and os.path.exists(tmp_file):
+                try:
+                    os.remove(tmp_file)
+                except OSError:
+                    pass

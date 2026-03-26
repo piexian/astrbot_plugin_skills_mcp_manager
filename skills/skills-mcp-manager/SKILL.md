@@ -134,13 +134,21 @@ description: AI Assistant for managing AstrBot Skills and MCP servers. Provides 
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| zip_path | string | ✅ | ZIP 文件的本地绝对路径 |
+| zip_path | string | ✅ | ZIP 文件路径（本地绝对路径或沙盒路径） |
+| skill_name_hint | string | ❌ | 可选，指定安装后的 Skill 名称（覆盖 ZIP 内目录名） |
 
-ZIP 文件要求：包含单个顶层文件夹，文件夹内含 `SKILL.md`。
+ZIP 文件要求：包含单个顶层文件夹（内含 `SKILL.md`），或直接在根目录包含 `SKILL.md`。
+
+> 📦 **沙盒模式**: `zip_path` 支持沙盒路径（如 `/workspace/my-skill.zip`），工具会自动从沙盒下载文件到主机安装。
 
 **调用示例:**
 ```json
 {"zip_path": "/tmp/my-new-skill.zip"}
+```
+
+**带 skill_name_hint 示例:**
+```json
+{"zip_path": "/tmp/skill.zip", "skill_name_hint": "my-custom-name"}
 ```
 
 **返回示例:**
@@ -152,9 +160,9 @@ ZIP 文件要求：包含单个顶层文件夹，文件夹内含 `SKILL.md`。
 }
 ```
 
-**失败示例（ZIP 结构不合法）:**
+**失败示例（同名 Skill 已存在）:**
 ```json
-{"ok": false, "error": "ZIP 文件必须包含单个顶层文件夹"}
+{"ok": false, "error": "同名 Skill 已存在，请先删除或使用 update_skill_from_zip 更新。"}
 ```
 
 ---
@@ -247,8 +255,10 @@ ZIP 文件要求：包含单个顶层文件夹，文件夹内含 `SKILL.md`。
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | skill_name | string | ✅ | 要更新的 Skill 名称 |
-| zip_path | string | ✅ | ZIP 文件路径 |
+| zip_path | string | ✅ | ZIP 文件路径（本地绝对路径或沙盒路径） |
 | confirm | boolean | ✅ | 必须为 true 才执行 |
+
+> 📦 **沙盒模式**: 同 `install_skill`，支持沙盒路径自动下载。
 
 **调用示例:**
 ```json
@@ -610,6 +620,78 @@ status 字段取值：
 
 ---
 
+## 从网络链接安装 Skill 或 MCP 服务器
+
+当用户提供一个 URL 链接要求安装 Skill 或 MCP 服务器时，你需要结合 AstrBot 内置工具完成下载和安装。
+
+### 从 URL 安装 Skill（沙盒模式）
+
+在沙盒模式下，使用 `astrbot_execute_shell` 在沙盒中下载 ZIP，然后直接传沙盒路径给 `install_skill`：
+
+1. 用 shell 下载 ZIP 到沙盒：
+   ```json
+   // astrbot_execute_shell
+   {"command": "wget -O /workspace/skill.zip https://example.com/my-skill.zip"}
+   ```
+   或使用 curl：
+   ```json
+   // astrbot_execute_shell
+   {"command": "curl -L -o /workspace/skill.zip https://example.com/my-skill.zip"}
+   ```
+2. 调用 `install_skill`，直接传沙盒路径（工具会自动从沙盒下载到主机）：
+   ```json
+   {"zip_path": "/workspace/skill.zip", "skill_name_hint": "my-skill"}
+   ```
+
+### 从 GitHub 仓库安装 Skill（沙盒模式）
+
+1. 用 shell 克隆仓库并打包：
+   ```json
+   // astrbot_execute_shell
+   {"command": "cd /workspace && git clone https://github.com/user/my-skill.git && cd my-skill && zip -r /workspace/my-skill.zip ."}
+   ```
+2. 调用 `install_skill`：
+   ```json
+   {"zip_path": "/workspace/my-skill.zip", "skill_name_hint": "my-skill"}
+   ```
+
+### 从 URL 安装 Skill（本地模式）
+
+在本地模式下，使用 `astrbot_execute_python` 下载文件：
+
+1. 用 Python 下载：
+   ```json
+   // astrbot_execute_python
+   {"code": "import urllib.request; urllib.request.urlretrieve('https://example.com/my-skill.zip', '/tmp/my-skill.zip'); print('/tmp/my-skill.zip')"}
+   ```
+2. 调用 `install_skill`：
+   ```json
+   {"zip_path": "/tmp/my-skill.zip"}
+   ```
+
+### 安装 stdio 类型 MCP 服务器的依赖（沙盒模式）
+
+对于需要安装 npm 包或 pip 包的 MCP 服务器，先在沙盒中安装依赖再添加配置：
+
+1. 用 shell 安装依赖（npm 示例）：
+   ```json
+   // astrbot_execute_shell
+   {"command": "npm install -g @modelcontextprotocol/server-filesystem"}
+   ```
+2. 用 shell 安装依赖（pip 示例）：
+   ```json
+   // astrbot_execute_shell
+   {"command": "pip install arxiv-mcp-server"}
+   ```
+3. 调用 `add_mcp_server` 添加配置：
+   ```json
+   {"server_name": "arxiv", "config": {"command": "python", "args": ["-m", "arxiv_mcp_server"]}}
+   ```
+
+> ⚠️ **注意**: 沙盒模式下 stdio 类型的 MCP 服务器进程运行在 **AstrBot 主机** 上，不是沙盒内。主机上需要有对应的命令可用。如果主机上没有安装依赖，可提醒用户手动在主机侧安装，或者使用远程 sse/streamable_http 方式连接。
+
+---
+
 ## 错误处理
 
 所有工具在失败时返回统一格式：
@@ -621,5 +703,6 @@ status 字段取值：
 - **权限不足**: `"权限不足。用户 xxx 不是管理员。请在管理面板配置管理员。"`
 - **名称无效**: `"无效的 Skill 名称: 'a/b'。只允许字母、数字、点、横线、下划线。"`
 - **目标不存在**: `"Skill 不存在: xxx"` / `"MCP 服务器不存在: xxx"`
+- **同名已存在**: `"同名 Skill 已存在，请先删除或使用 update_skill_from_zip 更新。"`
 - **连接超时**: `"启用 MCP 服务器 xxx 超时。请检查服务器配置和可用性。"`
 - **路径越权**: `"非法文件路径: 不允许访问 skills 目录外的文件。"`

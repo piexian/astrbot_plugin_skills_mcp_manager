@@ -2,6 +2,22 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [0.1.6] - 2026-03-26
+
+### Added
+- **沙盒环境适配**：`install_skill` 和 `update_skill_from_zip` 支持沙盒路径，自动通过 `ComputerBooter.download_file()` 静默下载到主机安装
+- **运行时感知**：`list_skills` 根据 `computer_use_runtime` 传入 `runtime` 参数，沙盒模式下正确展示沙盒 Skills
+- **安装后同步**：Skill 安装/更新后自动触发 `sync_skills_to_active_sandboxes()` 推送到活跃沙盒
+- **`skill_name_hint` 参数**：`install_skill` 新增可选参数，允许指定安装后的 Skill 名称（适配 AstrBot PR #6952）
+- **网络安装指南**：SKILL.md 新增「从网络链接安装 Skill 或 MCP 服务器」章节，覆盖沙盒/本地模式下的 URL 安装流程
+
+### Changed
+- `_SKILL_NAME_RE` 从 `^[A-Za-z0-9._-]+$` 更新为 `^[\w.-]+$`，支持中文 Skill 名称（适配 AstrBot PR #6952）
+- `install_skill` 描述更新：ZIP 支持根目录直接包含 SKILL.md 的结构
+
+### Fixed
+- `install_skill` 新增 `FileExistsError` 处理，重复安装时返回友好提示而非通用异常
+
 ## [0.1.5] - 2026-03-14
 
 ### Added
