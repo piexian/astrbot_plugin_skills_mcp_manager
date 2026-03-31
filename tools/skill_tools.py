@@ -819,6 +819,15 @@ class UpdateSkillFromZipTool(FunctionTool):
                                 f"ZIP 内 Skill 名 '{zip_skill_name}' 与目标 "
                                 f"'{skill_name}' 不一致，请检查 ZIP 文件。"
                             )
+                    elif len(top_dirs) != 1:
+                        # Files are in the ZIP root (no single top-level dir)
+                        # or multiple top-level dirs exist — ambiguous structure
+                        return _err(
+                            f"ZIP 文件结构不明确：期望包含单一顶层目录 "
+                            f"'{skill_name}'，但发现 {len(top_dirs)} 个"
+                            f"顶层条目 ({', '.join(sorted(top_dirs)[:5])})。"
+                            f"请将 Skill 文件放在以 Skill 名命名的目录中再打包。"
+                        )
 
             # Use install_skill_from_zip with overwrite=True
             installed_name = mgr.install_skill_from_zip(actual_zip_path, overwrite=True)

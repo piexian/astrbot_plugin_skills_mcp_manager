@@ -30,7 +30,10 @@ def mask_sensitive(config: dict) -> dict:
     """Mask sensitive values in config dict for safe display.
 
     Recursively processes nested dicts and lists, masking string values
-    whose parent key matches any entry in SENSITIVE_KEYS.
+    whose parent key (or any ancestor key) matches any entry in SENSITIVE_KEYS.
+    A ``parent_sensitive`` flag is threaded through the recursion so that all
+    string values under a sensitive ancestor are masked, even when nested
+    inside dicts or lists.
     """
 
     def _mask_str(v: Any) -> Any:
@@ -38,27 +41,31 @@ def mask_sensitive(config: dict) -> dict:
             return v[:2] + "***" + v[-2:]
         return "***"
 
-    def _process_value(k: str, v: Any) -> Any:
+    def _is_sensitive_key(k: str) -> bool:
+        lower = k.lower()
+        return any(s in lower for s in SENSITIVE_KEYS)
+
+    def _process_value(k: str, v: Any, parent_sensitive: bool = False) -> Any:
+        sensitive = parent_sensitive or _is_sensitive_key(k)
         if isinstance(v, dict):
-            return _process(v)
+            return _process(v, sensitive)
         if isinstance(v, list):
-            return _process_list(v, k)
-        if any(s in k.lower() for s in SENSITIVE_KEYS):
+            return _process_list(v, sensitive)
+        if sensitive:
             return _mask_str(v)
         return v
 
-    def _process(d: dict) -> dict:
-        return {k: _process_value(k, v) for k, v in d.items()}
+    def _process(d: dict, parent_sensitive: bool = False) -> dict:
+        return {k: _process_value(k, v, parent_sensitive) for k, v in d.items()}
 
-    def _process_list(lst: list, parent_key: str = "") -> list:
-        is_sensitive = any(s in parent_key.lower() for s in SENSITIVE_KEYS)
+    def _process_list(lst: list, parent_sensitive: bool = False) -> list:
         return [
-            _process(item)
+            _process(item, parent_sensitive)
             if isinstance(item, dict)
-            else _process_list(item, parent_key)
+            else _process_list(item, parent_sensitive)
             if isinstance(item, list)
             else _mask_str(item)
-            if is_sensitive
+            if parent_sensitive
             else item
             for item in lst
         ]
