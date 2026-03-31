@@ -16,6 +16,7 @@ from astrbot.api.event import AstrMessageEvent, MessageEventResult, filter
 from astrbot.core.skills.skill_manager import SkillManager
 from astrbot.core.utils.session_waiter import SessionController, session_waiter
 
+from .tools.utils import mask_sensitive
 from .tools import (
     AddMcpServerTool,
     DeleteSkillTool,
@@ -37,24 +38,6 @@ from .tools import (
 
 _SKILL_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 _MCP_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
-
-# Sensitive config keys for masking
-_SENSITIVE_KEYS = frozenset(
-    {
-        "api_key",
-        "apikey",
-        "token",
-        "secret",
-        "password",
-        "authorization",
-        "auth",
-        "credential",
-        "credentials",
-        "private_key",
-        "access_token",
-        "refresh_token",
-    }
-)
 
 
 class Main(star.Star):
@@ -144,26 +127,6 @@ class Main(star.Star):
             size /= 1024
         return f"{size:.1f}TB"
 
-    @staticmethod
-    def _mask_sensitive_config(config: dict) -> dict:
-        """Mask sensitive values in config for display."""
-
-        def _process(d: dict) -> dict:
-            result = {}
-            for k, v in d.items():
-                if isinstance(v, dict):
-                    result[k] = _process(v)
-                elif any(s in k.lower() for s in _SENSITIVE_KEYS):
-                    if isinstance(v, str) and len(v) > 4:
-                        result[k] = v[:2] + "***" + v[-2:]
-                    else:
-                        result[k] = "***"
-                else:
-                    result[k] = v
-            return result
-
-        return _process(config)
-
     # ==================== Skill Command Group ====================
 
     @filter.command_group("skill")
@@ -176,9 +139,9 @@ class Main(star.Star):
         mgr = SkillManager()
         skills = mgr.list_skills()
 
-        lines = ["📋 Skills 列表:\n"]
+        lines = ["Skills 列表:\n"]
         for s in skills:
-            status = "🟢" if s.active else "⚪"
+            status = "[运行中]" if s.active else "[已禁用]"
             lines.append(f"  {status} {s.name}: {s.description or '无描述'}")
 
         if not skills:
@@ -194,18 +157,21 @@ class Main(star.Star):
             event.set_result(MessageEventResult().message("用法: /skill on <名称>"))
             return
         if not _SKILL_NAME_RE.fullmatch(name):
-            event.set_result(MessageEventResult().message(f"❌ 无效名称: {name}"))
+            event.set_result(MessageEventResult().message(f"[失败] 无效名称: {name}"))
             return
         try:
             mgr = SkillManager()
             mgr.set_skill_active(name, True)
             event.set_result(
                 MessageEventResult().message(
-                    f"✅ 已启用 Skill: {name}\n💡 提示: 下一次对话生效"
+                    f"[成功] 已启用 Skill: {name}\n提示: 下一次对话生效"
                 )
             )
         except Exception as e:
-            event.set_result(MessageEventResult().message(f"❌ 启用失败: {e}"))
+            logger.error(f"skill_on failed for {name}: {e}")
+            event.set_result(
+                MessageEventResult().message("[失败] 启用失败，请查看日志")
+            )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @skill_group.command("off")
@@ -215,18 +181,21 @@ class Main(star.Star):
             event.set_result(MessageEventResult().message("用法: /skill off <名称>"))
             return
         if not _SKILL_NAME_RE.fullmatch(name):
-            event.set_result(MessageEventResult().message(f"❌ 无效名称: {name}"))
+            event.set_result(MessageEventResult().message(f"[失败] 无效名称: {name}"))
             return
         try:
             mgr = SkillManager()
             mgr.set_skill_active(name, False)
             event.set_result(
                 MessageEventResult().message(
-                    f"✅ 已禁用 Skill: {name}\n💡 提示: 下一次对话生效"
+                    f"[成功] 已禁用 Skill: {name}\n提示: 下一次对话生效"
                 )
             )
         except Exception as e:
-            event.set_result(MessageEventResult().message(f"❌ 禁用失败: {e}"))
+            logger.error(f"skill_off failed for {name}: {e}")
+            event.set_result(
+                MessageEventResult().message("[失败] 禁用失败，请查看日志")
+            )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @skill_group.command("del")
@@ -236,19 +205,23 @@ class Main(star.Star):
             event.set_result(MessageEventResult().message("用法: /skill del <名称>"))
             return
         if not _SKILL_NAME_RE.fullmatch(name):
-            event.set_result(MessageEventResult().message(f"❌ 无效名称: {name}"))
+            event.set_result(MessageEventResult().message(f"[失败] 无效名称: {name}"))
             return
         try:
             mgr = SkillManager()
             mgr.delete_skill(name)
             event.set_result(
                 MessageEventResult().message(
-                    f"✅ 已删除 Skill: {name}\n💡 提示: 下一次对话生效"
+                    f"[成功] 已删除 Skill: {name}\n提示: 下一次对话生效"
                 )
             )
         except Exception as e:
-            event.set_result(MessageEventResult().message(f"❌ 删除失败: {e}"))
+            logger.error(f"skill_del failed for {name}: {e}")
+            event.set_result(
+                MessageEventResult().message("[失败] 删除失败，请查看日志")
+            )
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @skill_group.command("files")
     async def skill_files(self, event: AstrMessageEvent, name: str = "") -> None:
         """列出 Skill 文件结构"""
@@ -256,7 +229,7 @@ class Main(star.Star):
             event.set_result(MessageEventResult().message("用法: /skill files <名称>"))
             return
         if not _SKILL_NAME_RE.fullmatch(name):
-            event.set_result(MessageEventResult().message(f"❌ 无效名称: {name}"))
+            event.set_result(MessageEventResult().message(f"[失败] 无效名称: {name}"))
             return
 
         mgr = SkillManager()
@@ -264,32 +237,35 @@ class Main(star.Star):
         skill_dir = (skills_root / name).resolve()
 
         if not skill_dir.exists():
-            event.set_result(MessageEventResult().message(f"❌ Skill 不存在: {name}"))
+            event.set_result(
+                MessageEventResult().message(f"[失败] Skill 不存在: {name}")
+            )
             return
 
         # Security check: ensure skill_dir is within skills_root
         try:
             skill_dir.relative_to(skills_root.resolve())
         except ValueError:
-            event.set_result(MessageEventResult().message("❌ 非法路径"))
+            event.set_result(MessageEventResult().message("[失败] 非法路径"))
             return
 
-        lines = [f"📁 Skill {name} 文件结构:\n"]
+        lines = [f"Skill {name} 文件结构:\n"]
         for root, dirs, files in os.walk(skill_dir):
             rel_root = Path(root).relative_to(skill_dir)
             level = len(rel_root.parts)
             indent = "  " * level
 
             for d in sorted(dirs):
-                lines.append(f"{indent}📁 {d}/")
+                lines.append(f"{indent}{d}/")
             for f in sorted(files):
                 file_path = Path(root) / f
                 size = file_path.stat().st_size
                 size_str = self._format_file_size(size)
-                lines.append(f"{indent}📄 {f} ({size_str})")
+                lines.append(f"{indent}{f} ({size_str})")
 
         event.set_result(MessageEventResult().message("\n".join(lines)).use_t2i(False))
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @skill_group.command("read")
     async def skill_read(
         self, event: AstrMessageEvent, name: str = "", file: str = ""
@@ -301,7 +277,7 @@ class Main(star.Star):
             )
             return
         if not _SKILL_NAME_RE.fullmatch(name):
-            event.set_result(MessageEventResult().message(f"❌ 无效名称: {name}"))
+            event.set_result(MessageEventResult().message(f"[失败] 无效名称: {name}"))
             return
 
         mgr = SkillManager()
@@ -313,11 +289,11 @@ class Main(star.Star):
         try:
             file_path.relative_to(skill_dir)
         except ValueError:
-            event.set_result(MessageEventResult().message("❌ 非法文件路径"))
+            event.set_result(MessageEventResult().message("[失败] 非法文件路径"))
             return
 
         if not file_path.exists():
-            event.set_result(MessageEventResult().message(f"❌ 文件不存在: {file}"))
+            event.set_result(MessageEventResult().message(f"[失败] 文件不存在: {file}"))
             return
 
         try:
@@ -326,11 +302,14 @@ class Main(star.Star):
                 content = content[:5000] + "\n\n... (内容过长，已截断)"
             event.set_result(
                 MessageEventResult()
-                .message(f"📄 {file}:\n\n```\n{content}\n```")
+                .message(f"{file}:\n\n```\n{content}\n```")
                 .use_t2i(False)
             )
         except Exception as e:
-            event.set_result(MessageEventResult().message(f"❌ 读取失败: {e}"))
+            logger.error(f"skill_read failed: {e}")
+            event.set_result(
+                MessageEventResult().message("[失败] 读取失败，请查看日志")
+            )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @skill_group.command("install")
@@ -340,7 +319,7 @@ class Main(star.Star):
 
         event.set_result(
             MessageEventResult().message(
-                "📤 Skill 批量安装模式已启动\n"
+                "Skill 批量安装模式已启动\n"
                 "发送 ZIP 文件安装 Skill，发送「结束」或「done」完成安装\n"
                 "超时时间: 120 秒"
             )
@@ -362,20 +341,23 @@ class Main(star.Star):
                     await event.send(event.plain_result(result))
                 else:
                     await event.send(
-                        event.plain_result("📤 批量安装已结束，未安装任何 Skill")
+                        event.plain_result("批量安装已结束，未安装任何 Skill")
                     )
                 controller.stop()
                 return
 
+            has_files = False
             for msg in event.get_messages():
                 if isinstance(msg, Comp.File):
+                    has_files = True
                     file_name = msg.name
                     if not file_name.lower().endswith(".zip"):
                         await event.send(
-                            event.plain_result(f"⚠️ {file_name}: 请发送 ZIP 格式的文件")
+                            event.plain_result(
+                                f"[警告] {file_name}: 请发送 ZIP 格式的文件"
+                            )
                         )
-                        controller.keep(timeout=120, reset_timeout=True)
-                        return
+                        continue
 
                     file_path_str = await msg.get_file()
                     try:
@@ -383,23 +365,27 @@ class Main(star.Star):
                         result = mgr.install_skill_from_zip(file_path_str)
                         installed.append((file_name, result))
                         await event.send(
-                            event.plain_result(f"✅ {file_name}: 安装成功")
+                            event.plain_result(f"[成功] {file_name}: 安装成功")
                         )
                     except Exception as e:
                         failed.append((file_name, str(e)))
+                        logger.error(f"skill_install failed for {file_name}: {e}")
                         await event.send(
-                            event.plain_result(f"❌ {file_name}: 安装失败 - {e}")
+                            event.plain_result(
+                                f"[失败] {file_name}: 安装失败，请查看日志"
+                            )
                         )
                     finally:
                         if file_path_str and os.path.exists(file_path_str):
                             os.remove(file_path_str)
 
-                    controller.keep(timeout=120, reset_timeout=True)
-                    return
+            if has_files:
+                controller.keep(timeout=120, reset_timeout=True)
+                return
 
             if event.message_str.strip():
                 await event.send(
-                    event.plain_result("⚠️ 请发送 ZIP 文件，或发送「结束」完成安装")
+                    event.plain_result("[警告] 请发送 ZIP 文件，或发送「结束」完成安装")
                 )
             controller.keep(timeout=120, reset_timeout=True)
 
@@ -408,12 +394,10 @@ class Main(star.Star):
         except TimeoutError:
             if installed or failed:
                 result = _format_install_result(installed, failed)
-                result = "⏰ 超时自动结束\n\n" + result
+                result = "超时自动结束\n\n" + result
                 event.set_result(MessageEventResult().message(result).use_t2i(False))
             else:
-                event.set_result(
-                    MessageEventResult().message("⏰ 超时，未收到任何文件")
-                )
+                event.set_result(MessageEventResult().message("超时，未收到任何文件"))
         finally:
             event.stop_event()
 
@@ -427,7 +411,7 @@ class Main(star.Star):
             event.set_result(MessageEventResult().message("用法: /skill update <名称>"))
             return
         if not _SKILL_NAME_RE.fullmatch(name):
-            event.set_result(MessageEventResult().message(f"❌ 无效名称: {name}"))
+            event.set_result(MessageEventResult().message(f"[失败] 无效名称: {name}"))
             return
 
         mgr = SkillManager()
@@ -437,14 +421,14 @@ class Main(star.Star):
         if not skill_dir.exists():
             event.set_result(
                 MessageEventResult().message(
-                    f"❌ Skill 不存在: {name}\n💡 使用 /skill install 安装新 Skill"
+                    f"[失败] Skill 不存在: {name}\n使用 /skill install 安装新 Skill"
                 )
             )
             return
 
         event.set_result(
             MessageEventResult().message(
-                f"📤 Skill 更新模式: {name}\n"
+                f"Skill 更新模式: {name}\n"
                 "发送 ZIP 文件覆盖整个 Skill，或发送单个文件更新指定文件\n"
                 "发送「结束」或「done」完成更新\n"
                 "超时时间: 120 秒"
@@ -467,13 +451,15 @@ class Main(star.Star):
                     await event.send(event.plain_result(result))
                 else:
                     await event.send(
-                        event.plain_result("📤 更新模式已结束，未更新任何文件")
+                        event.plain_result("更新模式已结束，未更新任何文件")
                     )
                 controller.stop()
                 return
 
+            has_files = False
             for msg in event.get_messages():
                 if isinstance(msg, Comp.File):
+                    has_files = True
                     file_name = msg.name
                     file_path_str = await msg.get_file()
                     try:
@@ -486,7 +472,7 @@ class Main(star.Star):
                             )
                             await event.send(
                                 event.plain_result(
-                                    f"✅ {file_name}: Skill 已从 ZIP 更新"
+                                    f"[成功] {file_name}: Skill 已从 ZIP 更新"
                                 )
                             )
                         else:
@@ -497,30 +483,37 @@ class Main(star.Star):
                             except ValueError:
                                 errors.append((file_name, "非法文件名: 路径逃逸"))
                                 await event.send(
-                                    event.plain_result(f"❌ {file_name}: 非法文件名")
+                                    event.plain_result(
+                                        f"[失败] {file_name}: 非法文件名"
+                                    )
                                 )
                                 continue
                             dest_path.parent.mkdir(parents=True, exist_ok=True)
                             shutil.copy(file_path_str, dest_path)
                             updated_files.append((file_name, "已更新"))
                             await event.send(
-                                event.plain_result(f"✅ {file_name}: 已更新")
+                                event.plain_result(f"[成功] {file_name}: 已更新")
                             )
                     except Exception as e:
                         errors.append((file_name, str(e)))
+                        logger.error(f"skill_update failed for {file_name}: {e}")
                         await event.send(
-                            event.plain_result(f"❌ {file_name}: 更新失败 - {e}")
+                            event.plain_result(
+                                f"[失败] {file_name}: 更新失败，请查看日志"
+                            )
                         )
                     finally:
                         if file_path_str and os.path.exists(file_path_str):
                             os.remove(file_path_str)
-                    controller.keep(timeout=120, reset_timeout=True)
-                    return
+
+            if has_files:
+                controller.keep(timeout=120, reset_timeout=True)
+                return
 
             if event.message_str.strip():
                 await event.send(
                     event.plain_result(
-                        "⚠️ 请发送 ZIP 文件或单个文件，或发送「结束」完成更新"
+                        "[警告] 请发送 ZIP 文件或单个文件，或发送「结束」完成更新"
                     )
                 )
             controller.keep(timeout=120, reset_timeout=True)
@@ -530,12 +523,10 @@ class Main(star.Star):
         except TimeoutError:
             if updated_files or errors:
                 result = _format_update_result(updated_files, errors)
-                result = "⏰ 超时自动结束\n\n" + result
+                result = "超时自动结束\n\n" + result
                 event.set_result(MessageEventResult().message(result).use_t2i(False))
             else:
-                event.set_result(
-                    MessageEventResult().message("⏰ 超时，未收到任何文件")
-                )
+                event.set_result(MessageEventResult().message("超时，未收到任何文件"))
         finally:
             event.stop_event()
 
@@ -552,17 +543,17 @@ class Main(star.Star):
         config = tool_mgr.load_mcp_config()
         runtime = tool_mgr.mcp_server_runtime_view
 
-        lines = ["📋 MCP 服务器列表:\n"]
+        lines = ["MCP 服务器列表:\n"]
         for name, cfg in config.get("mcpServers", {}).items():
             if not isinstance(cfg, dict):
                 continue
             active = cfg.get("active", False)
             if active and name in runtime:
-                status = "🟢 运行中"
+                status = "[运行中]"
             elif active:
-                status = "🟡 已启用"
+                status = "[已启用]"
             else:
-                status = "⚪ 已禁用"
+                status = "[已禁用]"
             lines.append(f"  {status} {name}")
 
         if not config.get("mcpServers"):
@@ -578,7 +569,7 @@ class Main(star.Star):
             event.set_result(MessageEventResult().message("用法: /mcp on <名称>"))
             return
         if not _MCP_NAME_RE.fullmatch(name):
-            event.set_result(MessageEventResult().message(f"❌ 无效名称: {name}"))
+            event.set_result(MessageEventResult().message(f"[失败] 无效名称: {name}"))
             return
         try:
             tool_mgr = self.context.get_llm_tool_manager()
@@ -586,7 +577,7 @@ class Main(star.Star):
             servers = config.get("mcpServers", {})
             if name not in servers:
                 event.set_result(
-                    MessageEventResult().message(f"❌ MCP 服务器不存在: {name}")
+                    MessageEventResult().message(f"[失败] MCP 服务器不存在: {name}")
                 )
                 return
 
@@ -597,19 +588,29 @@ class Main(star.Star):
 
             server_config["active"] = True
             config["mcpServers"][name] = server_config
-            tool_mgr.save_mcp_config(config)
+            if not tool_mgr.save_mcp_config(config):
+                logger.error(f"mcp_on: save_mcp_config failed for {name}")
+                event.set_result(
+                    MessageEventResult().message(
+                        f"[警告] 已启用 MCP: {name}，但保存配置失败，重启后需要手动执行 /mcp on {name}"
+                    )
+                )
+                return
 
             event.set_result(
                 MessageEventResult().message(
-                    f"✅ 已启用 MCP: {name}\n💡 提示: 下一次对话生效"
+                    f"[成功] 已启用 MCP: {name}\n提示: 下一次对话生效"
                 )
             )
         except TimeoutError:
             event.set_result(
-                MessageEventResult().message(f"❌ 启用 MCP 服务器 {name} 超时")
+                MessageEventResult().message(f"[失败] 启用 MCP 服务器 {name} 超时")
             )
         except Exception as e:
-            event.set_result(MessageEventResult().message(f"❌ 启用失败: {e}"))
+            logger.error(f"mcp_on failed for {name}: {e}")
+            event.set_result(
+                MessageEventResult().message("[失败] 启用失败，请查看日志")
+            )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @mcp_group.command("off")
@@ -619,7 +620,7 @@ class Main(star.Star):
             event.set_result(MessageEventResult().message("用法: /mcp off <名称>"))
             return
         if not _MCP_NAME_RE.fullmatch(name):
-            event.set_result(MessageEventResult().message(f"❌ 无效名称: {name}"))
+            event.set_result(MessageEventResult().message(f"[失败] 无效名称: {name}"))
             return
         try:
             tool_mgr = self.context.get_llm_tool_manager()
@@ -627,7 +628,7 @@ class Main(star.Star):
             servers = config.get("mcpServers", {})
             if name not in servers:
                 event.set_result(
-                    MessageEventResult().message(f"❌ MCP 服务器不存在: {name}")
+                    MessageEventResult().message(f"[失败] MCP 服务器不存在: {name}")
                 )
                 return
 
@@ -636,19 +637,29 @@ class Main(star.Star):
                 await tool_mgr.disable_mcp_server(name, timeout=10)
 
             servers[name]["active"] = False
-            tool_mgr.save_mcp_config(config)
+            if not tool_mgr.save_mcp_config(config):
+                logger.error(f"mcp_off: save_mcp_config failed for {name}")
+                event.set_result(
+                    MessageEventResult().message(
+                        f"[警告] 已禁用 MCP: {name}，但保存配置失败，重启后需要手动执行 /mcp off {name}"
+                    )
+                )
+                return
 
             event.set_result(
                 MessageEventResult().message(
-                    f"✅ 已禁用 MCP: {name}\n💡 提示: 下一次对话生效"
+                    f"[成功] 已禁用 MCP: {name}\n提示: 下一次对话生效"
                 )
             )
         except TimeoutError:
             event.set_result(
-                MessageEventResult().message(f"❌ 禁用 MCP 服务器 {name} 超时")
+                MessageEventResult().message(f"[失败] 禁用 MCP 服务器 {name} 超时")
             )
         except Exception as e:
-            event.set_result(MessageEventResult().message(f"❌ 禁用失败: {e}"))
+            logger.error(f"mcp_off failed for {name}: {e}")
+            event.set_result(
+                MessageEventResult().message("[失败] 禁用失败，请查看日志")
+            )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @mcp_group.command("del")
@@ -658,7 +669,7 @@ class Main(star.Star):
             event.set_result(MessageEventResult().message("用法: /mcp del <名称>"))
             return
         if not _MCP_NAME_RE.fullmatch(name):
-            event.set_result(MessageEventResult().message(f"❌ 无效名称: {name}"))
+            event.set_result(MessageEventResult().message(f"[失败] 无效名称: {name}"))
             return
         try:
             tool_mgr = self.context.get_llm_tool_manager()
@@ -666,7 +677,7 @@ class Main(star.Star):
 
             if name not in config.get("mcpServers", {}):
                 event.set_result(
-                    MessageEventResult().message(f"❌ MCP 服务器不存在: {name}")
+                    MessageEventResult().message(f"[失败] MCP 服务器不存在: {name}")
                 )
                 return
 
@@ -675,17 +686,31 @@ class Main(star.Star):
                 await tool_mgr.disable_mcp_server(name, timeout=10)
 
             del config["mcpServers"][name]
-            tool_mgr.save_mcp_config(config)
+            if not tool_mgr.save_mcp_config(config):
+                logger.error(f"mcp_del: save_mcp_config failed for {name}")
+                event.set_result(
+                    MessageEventResult().message(
+                        f"[警告] 已从运行时移除 MCP: {name}，但保存配置失败"
+                    )
+                )
+                return
 
-            event.set_result(MessageEventResult().message(f"✅ 已删除 MCP: {name}"))
+            event.set_result(MessageEventResult().message(f"[成功] 已删除 MCP: {name}"))
         except Exception as e:
-            event.set_result(MessageEventResult().message(f"❌ 删除失败: {e}"))
+            logger.error(f"mcp_del failed for {name}: {e}")
+            event.set_result(
+                MessageEventResult().message("[失败] 删除失败，请查看日志")
+            )
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @mcp_group.command("config")
     async def mcp_config(self, event: AstrMessageEvent, name: str = "") -> None:
         """查看 MCP 服务器详细配置"""
         if not name:
             event.set_result(MessageEventResult().message("用法: /mcp config <名称>"))
+            return
+        if not _MCP_NAME_RE.fullmatch(name):
+            event.set_result(MessageEventResult().message(f"[失败] 无效名称: {name}"))
             return
 
         tool_mgr = self.context.get_llm_tool_manager()
@@ -694,7 +719,7 @@ class Main(star.Star):
 
         if name not in servers:
             event.set_result(
-                MessageEventResult().message(f"❌ MCP 服务器不存在: {name}")
+                MessageEventResult().message(f"[失败] MCP 服务器不存在: {name}")
             )
             return
 
@@ -703,14 +728,14 @@ class Main(star.Star):
         active = server_config.get("active", False)
         is_running = name in runtime
 
-        lines = [f"📋 MCP 服务器配置: {name}\n"]
+        lines = [f"MCP 服务器配置: {name}\n"]
 
         if is_running:
-            status = "🟢 运行中"
+            status = "[运行中]"
         elif active:
-            status = "🟡 已启用"
+            status = "[已启用]"
         else:
-            status = "⚪ 已禁用"
+            status = "[已禁用]"
         lines.append(f"状态: {status}\n")
 
         # Config details
@@ -743,7 +768,7 @@ class Main(star.Star):
                     lines.append(f"  ... 还有 {len(tools) - 10} 个工具")
 
         # Masked full config
-        masked = self._mask_sensitive_config(server_config)
+        masked = mask_sensitive(server_config)
         config_display = json.dumps(masked, ensure_ascii=False, indent=2)
         lines.append("\n完整配置 (已隐藏敏感信息):")
         lines.append(f"```json\n{config_display}\n```")
@@ -760,11 +785,11 @@ class Main(star.Star):
             )
             return
         if not _MCP_NAME_RE.fullmatch(name):
-            event.set_result(MessageEventResult().message(f"❌ 无效名称: {name}"))
+            event.set_result(MessageEventResult().message(f"[失败] 无效名称: {name}"))
             return
 
         help_text = (
-            "📤 请发送 MCP 服务器配置（JSON 格式）:\n\n"
+            "请发送 MCP 服务器配置（JSON 格式）:\n\n"
             '示例 (stdio):\n{"command": "uv", "args": ["tool", "run", "mcp-server"]}\n\n'
             '示例 (SSE):\n{"url": "https://example.com/mcp/sse", "transport": "sse"}\n\n'
             '示例 (HTTP):\n{"url": "https://example.com/mcp", "transport": "streamable_http"}\n\n'
@@ -779,14 +804,14 @@ class Main(star.Star):
             config_text = event.message_str.strip()
 
             if config_text.lower() in ("取消", "cancel", "exit", "quit"):
-                await event.send(event.plain_result("📤 已取消"))
+                await event.send(event.plain_result("已取消"))
                 controller.stop()
                 return
 
             try:
                 server_config = json.loads(config_text)
             except json.JSONDecodeError:
-                await event.send(event.plain_result("❌ JSON 格式错误，请重新发送"))
+                await event.send(event.plain_result("[失败] JSON 格式错误，请重新发送"))
                 controller.keep(timeout=60, reset_timeout=True)
                 return
 
@@ -794,10 +819,13 @@ class Main(star.Star):
 
             # Test connection
             try:
-                await event.send(event.plain_result("🔄 正在测试连接..."))
+                await event.send(event.plain_result("正在测试连接..."))
                 await tool_mgr.test_mcp_server_connection(server_config)
             except Exception as e:
-                await event.send(event.plain_result(f"❌ 连接测试失败: {e}"))
+                logger.error(f"mcp_add connection test failed: {e}")
+                await event.send(
+                    event.plain_result("[失败] 连接测试失败，请检查配置或查看日志")
+                )
                 controller.stop()
                 return
 
@@ -805,34 +833,40 @@ class Main(star.Star):
             server_config["active"] = True
             config = tool_mgr.load_mcp_config()
             config.setdefault("mcpServers", {})[name] = server_config
-            tool_mgr.save_mcp_config(config)
+            if not tool_mgr.save_mcp_config(config):
+                logger.error(f"mcp_add: save_mcp_config failed for {name}")
+                await event.send(event.plain_result("[失败] 保存配置失败"))
+                controller.stop()
+                return
 
             try:
                 await tool_mgr.enable_mcp_server(name, server_config, timeout=30)
                 await event.send(
                     event.plain_result(
-                        f"✅ MCP 服务器 '{name}' 添加成功！\n"
-                        "💡 提示: 新工具将在下一次对话生效"
+                        f"[成功] MCP 服务器 '{name}' 添加成功！\n"
+                        "提示: 新工具将在下一次对话生效"
                     )
                 )
             except Exception as e:
                 # Rollback: remove the saved config entry
+                logger.error(f"mcp_add: enable failed for {name}: {e}")
                 try:
                     rollback_config = tool_mgr.load_mcp_config()
                     rollback_config.get("mcpServers", {}).pop(name, None)
-                    tool_mgr.save_mcp_config(rollback_config)
+                    if not tool_mgr.save_mcp_config(rollback_config):
+                        logger.error(f"mcp_add: rollback save also failed for {name}")
                 except Exception:
                     pass
-                await event.send(event.plain_result(f"❌ 启用失败，已回滚配置: {e}"))
+                await event.send(
+                    event.plain_result("[失败] 启用失败，已回滚配置，请查看日志")
+                )
 
             controller.stop()
 
         try:
             await config_waiter(event)
         except TimeoutError:
-            event.set_result(
-                MessageEventResult().message("⏰ 操作超时，请重新发送命令")
-            )
+            event.set_result(MessageEventResult().message("操作超时，请重新发送命令"))
         finally:
             event.stop_event()
 
@@ -843,6 +877,9 @@ class Main(star.Star):
         if not name:
             event.set_result(MessageEventResult().message("用法: /mcp update <名称>"))
             return
+        if not _MCP_NAME_RE.fullmatch(name):
+            event.set_result(MessageEventResult().message(f"[失败] 无效名称: {name}"))
+            return
 
         tool_mgr = self.context.get_llm_tool_manager()
         config = tool_mgr.load_mcp_config()
@@ -850,16 +887,16 @@ class Main(star.Star):
 
         if name not in servers:
             event.set_result(
-                MessageEventResult().message(f"❌ MCP 服务器不存在: {name}")
+                MessageEventResult().message(f"[失败] MCP 服务器不存在: {name}")
             )
             return
 
         current_config = servers[name]
-        masked = self._mask_sensitive_config(current_config.copy())
+        masked = mask_sensitive(current_config.copy())
         current_json = json.dumps(masked, ensure_ascii=False, indent=2)
 
         help_text = (
-            f"📤 更新 MCP 服务器: {name}\n\n"
+            f"更新 MCP 服务器: {name}\n\n"
             f"当前配置 (敏感信息已隐藏):\n```json\n{current_json}\n```\n\n"
             "请发送新的配置（JSON 格式），或发送「取消」放弃更新:\n"
             "等待输入（60秒）..."
@@ -873,14 +910,14 @@ class Main(star.Star):
             config_text = event.message_str.strip()
 
             if config_text.lower() in ("取消", "cancel", "exit", "quit"):
-                await event.send(event.plain_result("📤 已取消更新"))
+                await event.send(event.plain_result("已取消更新"))
                 controller.stop()
                 return
 
             try:
                 new_config = json.loads(config_text)
             except json.JSONDecodeError:
-                await event.send(event.plain_result("❌ JSON 格式错误，请重新发送"))
+                await event.send(event.plain_result("[失败] JSON 格式错误，请重新发送"))
                 controller.keep(timeout=60, reset_timeout=True)
                 return
 
@@ -890,15 +927,19 @@ class Main(star.Star):
 
             # Test connection
             try:
-                await event.send(event.plain_result("🔄 正在测试新配置..."))
+                await event.send(event.plain_result("正在测试新配置..."))
                 await tool_mgr.test_mcp_server_connection(new_config)
             except Exception as e:
-                await event.send(event.plain_result(f"❌ 连接测试失败: {e}"))
+                logger.error(f"mcp_update connection test failed: {e}")
+                await event.send(
+                    event.plain_result("[失败] 连接测试失败，请检查配置或查看日志")
+                )
                 controller.stop()
                 return
 
             # Disable old if running
             was_active = current_config.get("active", True)
+            was_running = name in tool_mgr.mcp_server_runtime_view
             if was_active:
                 try:
                     await tool_mgr.disable_mcp_server(name)
@@ -907,21 +948,65 @@ class Main(star.Star):
 
             # Save new config
             config["mcpServers"][name] = new_config
-            tool_mgr.save_mcp_config(config)
+            if not tool_mgr.save_mcp_config(config):
+                # Rollback: restore old config
+                config["mcpServers"][name] = current_config
+                if not tool_mgr.save_mcp_config(config):
+                    logger.error(f"mcp_update: rollback save also failed for {name}")
+                    await event.send(
+                        event.plain_result(
+                            "[失败] 保存配置失败，且回滚也未成功，请手动检查配置文件"
+                        )
+                    )
+                    controller.stop()
+                    return
+                if was_running:
+                    try:
+                        await tool_mgr.enable_mcp_server(
+                            name, current_config, timeout=30
+                        )
+                    except Exception:
+                        pass
+                await event.send(event.plain_result("[失败] 保存配置失败，已回滚"))
+                controller.stop()
+                return
 
             # Re-enable if active
             if new_config.get("active", True):
                 try:
                     await tool_mgr.enable_mcp_server(name, new_config, timeout=30)
                 except Exception as e:
-                    await event.send(event.plain_result(f"⚠️ 配置已保存但启用失败: {e}"))
+                    # Rollback: restore old config and re-enable
+                    logger.error(f"mcp_update: enable failed for {name}: {e}")
+                    config["mcpServers"][name] = current_config
+                    if not tool_mgr.save_mcp_config(config):
+                        logger.error(f"mcp_update: rollback save failed for {name}")
+                        await event.send(
+                            event.plain_result(
+                                "[失败] 启用新配置失败，且回滚也未成功，请手动检查配置文件"
+                            )
+                        )
+                        controller.stop()
+                        return
+                    if was_running:
+                        try:
+                            await tool_mgr.enable_mcp_server(
+                                name, current_config, timeout=30
+                            )
+                        except Exception:
+                            pass
+                    await event.send(
+                        event.plain_result(
+                            "[失败] 启用新配置失败，已回滚旧配置，请查看日志"
+                        )
+                    )
                     controller.stop()
                     return
 
             await event.send(
                 event.plain_result(
-                    f"✅ MCP 服务器 '{name}' 更新成功！\n"
-                    "💡 提示: 变更将在下一次对话生效"
+                    f"[成功] MCP 服务器 '{name}' 更新成功！\n"
+                    "提示: 变更将在下一次对话生效"
                 )
             )
             controller.stop()
@@ -929,9 +1014,7 @@ class Main(star.Star):
         try:
             await config_waiter(event)
         except TimeoutError:
-            event.set_result(
-                MessageEventResult().message("⏰ 操作超时，请重新发送命令")
-            )
+            event.set_result(MessageEventResult().message("操作超时，请重新发送命令"))
         finally:
             event.stop_event()
 
@@ -942,7 +1025,7 @@ class Main(star.Star):
 def _validate_and_update_from_zip(
     skill_dir: Path, zip_path: str, expected_name: str
 ) -> int:
-    """Validate ZIP and update Skill, return number of files updated."""
+    """Validate ZIP and update Skill with best-effort backup and rollback, return number of files updated."""
     import zipfile
 
     with zipfile.ZipFile(zip_path) as zf:
@@ -979,20 +1062,47 @@ def _validate_and_update_from_zip(
             zf.extractall(tmp_dir)
             src_dir = Path(tmp_dir) / zip_skill_name
 
-            # Clear and copy
-            for item in skill_dir.iterdir():
-                if item.is_dir():
-                    shutil.rmtree(item)
-                else:
-                    item.unlink()
-            for item in src_dir.iterdir():
-                if item.is_dir():
-                    shutil.copytree(item, skill_dir / item.name)
-                else:
-                    shutil.copy2(item, skill_dir / item.name)
+            # Best-effort replacement: move current to backup, then replace
+            import uuid as _uuid
 
-            # Count actual files (recursive)
-            file_count = sum(1 for f in src_dir.rglob("*") if f.is_file())
+            backup_dir = (
+                skill_dir.parent / f".{skill_dir.name}.bak.{_uuid.uuid4().hex[:8]}"
+            )
+            rollback_failed = False
+            try:
+                # Move current to backup (fast rename, unique path avoids
+                # discarding a prior backup from a failed rollback)
+                shutil.move(skill_dir, backup_dir)
+                skill_dir.mkdir()
+
+                # Copy new files
+                for item in src_dir.iterdir():
+                    if item.is_dir():
+                        shutil.copytree(item, skill_dir / item.name)
+                    else:
+                        shutil.copy2(item, skill_dir / item.name)
+
+                # Count actual files (recursive)
+                file_count = sum(1 for f in src_dir.rglob("*") if f.is_file())
+            except Exception:
+                # Rollback: restore from backup
+                try:
+                    if backup_dir.exists():
+                        if skill_dir.exists():
+                            shutil.rmtree(skill_dir)
+                        shutil.move(backup_dir, skill_dir)
+                except Exception as rollback_err:
+                    rollback_failed = True
+                    logger.error(f"Skill 更新回滚失败: {rollback_err}")
+                raise
+            finally:
+                # Clean up backup only if rollback succeeded
+                if not rollback_failed and backup_dir.exists():
+                    try:
+                        shutil.rmtree(backup_dir)
+                    except Exception:
+                        pass
+
             return file_count
 
 
@@ -1000,16 +1110,16 @@ def _format_install_result(
     installed: list[tuple[str, str]], failed: list[tuple[str, str]]
 ) -> str:
     """Format skill installation result."""
-    lines = ["📊 Skill 安装结果:\n"]
+    lines = ["Skill 安装结果:\n"]
     if installed:
-        lines.append("✅ 成功:")
+        lines.append("[成功] 成功:")
         for n, r in installed:
             lines.append(f"  • {n}: {r}")
     if failed:
-        lines.append("\n❌ 失败:")
+        lines.append("\n[失败] 失败:")
         for n, e in failed:
             lines.append(f"  • {n}: {e}")
-    lines.append("\n💡 提示: 新 Skills 将在下次对话生效")
+    lines.append("\n提示: 新 Skills 将在下次对话生效")
     return "\n".join(lines)
 
 
@@ -1017,14 +1127,14 @@ def _format_update_result(
     updated: list[tuple[str, str]], errors: list[tuple[str, str]]
 ) -> str:
     """Format skill update result."""
-    lines = ["📊 Skill 更新结果:\n"]
+    lines = ["Skill 更新结果:\n"]
     if updated:
-        lines.append("✅ 更新成功:")
+        lines.append("[成功] 更新成功:")
         for n, info in updated:
             lines.append(f"  • {n}: {info}")
     if errors:
-        lines.append("\n❌ 更新失败:")
+        lines.append("\n[失败] 更新失败:")
         for n, error in errors:
             lines.append(f"  • {n}: {error}")
-    lines.append("\n💡 提示: Skill 变更将在下次对话生效")
+    lines.append("\n提示: Skill 变更将在下次对话生效")
     return "\n".join(lines)

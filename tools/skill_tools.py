@@ -17,6 +17,8 @@ from astrbot.core.astr_agent_context import AstrAgentContext
 from astrbot.core.skills.skill_manager import SkillManager
 from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
 
+from .utils import MAX_DIFF_TARGET_LEN
+
 _SKILL_NAME_RE = re.compile(r"^[\w.-]+$")
 
 _REFRESH_HINT = (
@@ -156,7 +158,7 @@ class ListSkillsTool(FunctionTool):
             return _ok(data={"skills": result})
         except Exception as e:
             logger.error(f"list_skills failed: {e}")
-            return _err(str(e))
+            return _err("列出 Skills 失败，请稍后重试。")
 
 
 # ---------------------------------------------------------------------------
@@ -199,7 +201,7 @@ class EnableSkillTool(FunctionTool):
             return _ok(message=f"已启用 Skill: {skill_name}。{_REFRESH_HINT}")
         except Exception as e:
             logger.error(f"enable_skill failed: {e}")
-            return _err(str(e))
+            return _err("启用 Skill 失败，请检查 Skill 名称是否正确。")
 
 
 # ---------------------------------------------------------------------------
@@ -244,7 +246,7 @@ class DisableSkillTool(FunctionTool):
             return _ok(message=f"已禁用 Skill: {skill_name}。{_REFRESH_HINT}")
         except Exception as e:
             logger.error(f"disable_skill failed: {e}")
-            return _err(str(e))
+            return _err("禁用 Skill 失败，请检查 Skill 名称是否正确。")
 
 
 # ---------------------------------------------------------------------------
@@ -297,7 +299,7 @@ class DeleteSkillTool(FunctionTool):
             return _ok(message=f"已删除 Skill: {skill_name}。{_REFRESH_HINT}")
         except Exception as e:
             logger.error(f"delete_skill failed: {e}")
-            return _err(str(e))
+            return _err("删除 Skill 失败，请检查 Skill 名称是否正确。")
 
 
 # ---------------------------------------------------------------------------
@@ -369,7 +371,7 @@ class InstallSkillTool(FunctionTool):
             )
         except Exception as e:
             logger.error(f"install_skill failed: {e}")
-            return _err(str(e))
+            return _err("安装 Skill 失败。请检查 ZIP 文件格式是否正确。")
         finally:
             if tmp_file and os.path.exists(tmp_file):
                 try:
@@ -389,7 +391,7 @@ class ListSkillFilesTool(FunctionTool):
 
     name: str = "list_skill_files"
     description: str = (
-        "列出指定 Skill 的文件结构。无需管理员权限。返回 Skill 目录下的所有文件列表。"
+        "列出指定 Skill 的文件结构。需要管理员权限。返回 Skill 目录下的所有文件列表。"
     )
     parameters: dict = field(
         default_factory=lambda: {
@@ -410,6 +412,8 @@ class ListSkillFilesTool(FunctionTool):
         skill_name: str = "",
         **kwargs: Any,
     ) -> ToolExecResult:
+        if err := _ensure_admin(context):
+            return err
         if err := _validate_skill_name(skill_name):
             return err
         try:
@@ -433,7 +437,7 @@ class ListSkillFilesTool(FunctionTool):
             return _ok(data={"skill_name": skill_name, "files": files})
         except Exception as e:
             logger.error(f"list_skill_files failed: {e}")
-            return _err(str(e))
+            return _err("列出文件失败。请检查 Skill 名称是否正确。")
 
 
 # ---------------------------------------------------------------------------
@@ -447,7 +451,7 @@ class ReadSkillFileTool(FunctionTool):
 
     name: str = "read_skill_file"
     description: str = (
-        "读取指定 Skill 中的文件内容。无需管理员权限。"
+        "读取指定 Skill 中的文件内容。需要管理员权限。"
         "可用于读取 SKILL.md 或其他脚本文件。"
     )
     parameters: dict = field(
@@ -474,6 +478,8 @@ class ReadSkillFileTool(FunctionTool):
         file_path: str = "",
         **kwargs: Any,
     ) -> ToolExecResult:
+        if err := _ensure_admin(context):
+            return err
         if err := _validate_skill_name(skill_name):
             return err
         if not file_path:
@@ -508,7 +514,7 @@ class ReadSkillFileTool(FunctionTool):
             )
         except Exception as e:
             logger.error(f"read_skill_file failed: {e}")
-            return _err(str(e))
+            return _err("读取文件失败。请检查文件路径是否正确。")
 
 
 # ---------------------------------------------------------------------------
@@ -543,6 +549,8 @@ _DIFF_DESC = (
     "请提供要替换的原始文本片段和替换后的文本。"
     "系统会在文件中查找原始文本并验证匹配度，匹配成功后执行替换。"
     "文件必须已存在。"
+    f"注意: target_content 最大长度为 {MAX_DIFF_TARGET_LEN} 字符。"
+    "如果需要修改的内容较多，请分多次调用，每次只替换一个片段。"
 )
 _DIFF_PARAMS: dict = {
     "type": "object",
@@ -626,7 +634,7 @@ class UpdateSkillFileTool(FunctionTool):
                 return self._apply_full_replace(target, skill_name, file_path, content)
         except Exception as e:
             logger.error(f"update_skill_file failed: {e}")
-            return _err(str(e))
+            return _err("更新文件失败。请检查文件路径和内容。")
 
     def _apply_full_replace(
         self, target: Path, skill_name: str, file_path: str, content: str
@@ -649,6 +657,10 @@ class UpdateSkillFileTool(FunctionTool):
 
         if not target_content:
             return _err("target_content 不能为空。")
+
+        # Input length limit to prevent performance issues
+        if len(target_content) > MAX_DIFF_TARGET_LEN:
+            return _err(f"target_content 超出长度限制 ({MAX_DIFF_TARGET_LEN} 字符)。")
 
         if not target.exists():
             return _err(
@@ -785,18 +797,58 @@ class UpdateSkillFromZipTool(FunctionTool):
                     f"Skill 不存在: {skill_name}。请使用 install_skill 安装新 Skill。"
                 )
 
+            # Pre-validate: check ZIP skill name matches target before overwriting
+            import zipfile
+
+            with zipfile.ZipFile(actual_zip_path) as zf:
+                members = [
+                    n.replace("\\", "/")
+                    for n in zf.namelist()
+                    if n and not n.endswith("/")
+                ]
+                if members:
+                    top_dirs = {
+                        Path(n).parts[0]
+                        for n in members
+                        if n.strip() and Path(n).parts[0] not in ("__MACOSX",)
+                    }
+                    if len(top_dirs) == 1:
+                        zip_skill_name = next(iter(top_dirs))
+                        if zip_skill_name != skill_name:
+                            return _err(
+                                f"ZIP 内 Skill 名 '{zip_skill_name}' 与目标 "
+                                f"'{skill_name}' 不一致，请检查 ZIP 文件。"
+                            )
+                    else:
+                        # Files are in the ZIP root (no single top-level dir)
+                        # or multiple top-level dirs exist — ambiguous structure
+                        return _err(
+                            f"ZIP 文件结构不明确：期望包含单一顶层目录 "
+                            f"'{skill_name}'，但发现 {len(top_dirs)} 个"
+                            f"顶层条目 ({', '.join(sorted(top_dirs)[:5])})。"
+                            f"请将 Skill 文件放在以 Skill 名命名的目录中再打包。"
+                        )
+
             # Use install_skill_from_zip with overwrite=True
             installed_name = mgr.install_skill_from_zip(actual_zip_path, overwrite=True)
 
-            # Verify the ZIP contained the expected skill
+            # Post-install verification: ensure installed name matches target
             if installed_name != skill_name:
-                # Rollback: the ZIP installed to a different skill directory
+                # Rollback: remove the incorrectly installed skill
                 try:
-                    mgr.delete_skill(installed_name)
-                except Exception:
-                    pass
+                    installed_dir = skills_root / installed_name
+                    if installed_dir.exists():
+                        import shutil
+
+                        shutil.rmtree(installed_dir)
+                except Exception as rollback_err:
+                    logger.error(
+                        f"update_skill_from_zip rollback failed for "
+                        f"'{installed_name}': {rollback_err}"
+                    )
                 return _err(
-                    f"ZIP 内 Skill 名 '{installed_name}' 与目标 '{skill_name}' 不一致，已回滚。"
+                    f"ZIP 实际安装到 '{installed_name}'，与目标 "
+                    f"'{skill_name}' 不一致，已回滚。请检查 ZIP 文件结构。"
                 )
 
             _try_sync_to_sandboxes()
@@ -806,7 +858,7 @@ class UpdateSkillFromZipTool(FunctionTool):
             )
         except Exception as e:
             logger.error(f"update_skill_from_zip failed: {e}")
-            return _err(str(e))
+            return _err("从 ZIP 更新 Skill 失败。请检查 ZIP 文件格式是否正确。")
         finally:
             if tmp_file and os.path.exists(tmp_file):
                 try:
