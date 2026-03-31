@@ -269,6 +269,7 @@ class EnableMcpServerTool(FunctionTool):
             server_config["active"] = True
             config["mcpServers"][server_name] = server_config
             if not tool_mgr.save_mcp_config(config):
+                logger.error(f"enable_mcp_server: save_mcp_config failed for {server_name}")
                 return _err("已启用但保存配置失败，重启后需要手动重新启用。")
 
             return _ok(message=f"已启用 MCP 服务器: {server_name}。{_REFRESH_HINT}")
@@ -332,6 +333,7 @@ class DisableMcpServerTool(FunctionTool):
             # Update config after successful disable
             servers[server_name]["active"] = False
             if not tool_mgr.save_mcp_config(config):
+                logger.error(f"disable_mcp_server: save_mcp_config failed for {server_name}")
                 return _err("已禁用但保存配置失败，重启后需要手动重新禁用。")
 
             return _ok(message=f"已禁用 MCP 服务器: {server_name}。{_REFRESH_HINT}")
@@ -411,6 +413,7 @@ class AddMcpServerTool(FunctionTool):
             config["active"] = True
             mcp_config.setdefault("mcpServers", {})[server_name] = config
             if not tool_mgr.save_mcp_config(mcp_config):
+                logger.error(f"add_mcp_server: save_mcp_config failed for {server_name}")
                 return _err("保存配置失败。")
 
             # Enable the server
@@ -742,6 +745,7 @@ class RemoveMcpServerTool(FunctionTool):
             # Remove from config
             del config["mcpServers"][server_name]
             if not tool_mgr.save_mcp_config(config):
+                logger.error(f"remove_mcp_server: save_mcp_config failed for {server_name}")
                 return _err("保存配置失败。")
 
             return _ok(message=f"已移除 MCP 服务器: {server_name}。{_REFRESH_HINT}")

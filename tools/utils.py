@@ -29,11 +29,11 @@ MAX_DIFF_TARGET_LEN = 50000
 def mask_sensitive(config: dict) -> dict:
     """Mask sensitive values in config dict for safe display.
 
-    Recursively processes nested dicts and lists, masking string values
-    whose parent key (or any ancestor key) matches any entry in SENSITIVE_KEYS.
-    A ``parent_sensitive`` flag is threaded through the recursion so that all
-    string values under a sensitive ancestor are masked, even when nested
-    inside dicts or lists.
+    Recursively processes nested dicts and lists, masking values whose
+    parent key matches any entry in SENSITIVE_KEYS.
+
+    For collections (lists/dicts) under a sensitive key, the entire
+    collection is masked rather than exposing nested structure.
     """
 
     def _mask_str(v: Any) -> Any:
@@ -45,29 +45,31 @@ def mask_sensitive(config: dict) -> dict:
         lower = k.lower()
         return any(s in lower for s in SENSITIVE_KEYS)
 
-    def _process_value(k: str, v: Any, parent_sensitive: bool = False) -> Any:
-        sensitive = parent_sensitive or _is_sensitive_key(k)
-        if isinstance(v, dict):
-            return _process(v, sensitive)
-        if isinstance(v, list):
-            return _process_list(v, sensitive)
-        if sensitive:
+    def _process_value(k: str, v: Any) -> Any:
+        if _is_sensitive_key(k):
+            # Entire value under a sensitive key is masked, including
+            # nested dicts/lists, so no internal fields are exposed.
             return _mask_str(v)
+        if isinstance(v, dict):
+            return _process(v)
+        if isinstance(v, list):
+            return _process_list(v)
         return v
 
-    def _process(d: dict, parent_sensitive: bool = False) -> dict:
-        return {k: _process_value(k, v, parent_sensitive) for k, v in d.items()}
+    def _process(d: dict) -> dict:
+        return {k: _process_value(k, v) for k, v in d.items()}
 
-    def _process_list(lst: list, parent_sensitive: bool = False) -> list:
+    def _process_list(lst: list) -> list:
         return [
-            _process(item, parent_sensitive)
+            _process(item)
             if isinstance(item, dict)
-            else _process_list(item, parent_sensitive)
+            else _process_list(item)
             if isinstance(item, list)
-            else _mask_str(item)
-            if parent_sensitive
             else item
             for item in lst
         ]
+
+    if not isinstance(config, dict):
+        return config
 
     return _process(config)

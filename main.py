@@ -589,6 +589,7 @@ class Main(star.Star):
             server_config["active"] = True
             config["mcpServers"][name] = server_config
             if not tool_mgr.save_mcp_config(config):
+                logger.error(f"mcp_on: save_mcp_config failed for {name}")
                 event.set_result(
                     MessageEventResult().message(
                         f"[警告] 已启用 MCP: {name}，但保存配置失败，重启后需要手动执行 /mcp on {name}"
@@ -637,6 +638,7 @@ class Main(star.Star):
 
             servers[name]["active"] = False
             if not tool_mgr.save_mcp_config(config):
+                logger.error(f"mcp_off: save_mcp_config failed for {name}")
                 event.set_result(
                     MessageEventResult().message(
                         f"[警告] 已禁用 MCP: {name}，但保存配置失败，重启后需要手动执行 /mcp off {name}"
@@ -685,6 +687,7 @@ class Main(star.Star):
 
             del config["mcpServers"][name]
             if not tool_mgr.save_mcp_config(config):
+                logger.error(f"mcp_del: save_mcp_config failed for {name}")
                 event.set_result(
                     MessageEventResult().message(
                         f"[警告] 已从运行时移除 MCP: {name}，但保存配置失败"
@@ -831,6 +834,7 @@ class Main(star.Star):
             config = tool_mgr.load_mcp_config()
             config.setdefault("mcpServers", {})[name] = server_config
             if not tool_mgr.save_mcp_config(config):
+                logger.error(f"mcp_add: save_mcp_config failed for {name}")
                 await event.send(event.plain_result("[失败] 保存配置失败"))
                 controller.stop()
                 return

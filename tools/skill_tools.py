@@ -819,7 +819,7 @@ class UpdateSkillFromZipTool(FunctionTool):
                                 f"ZIP 内 Skill 名 '{zip_skill_name}' 与目标 "
                                 f"'{skill_name}' 不一致，请检查 ZIP 文件。"
                             )
-                    elif len(top_dirs) != 1:
+                    else:
                         # Files are in the ZIP root (no single top-level dir)
                         # or multiple top-level dirs exist — ambiguous structure
                         return _err(
