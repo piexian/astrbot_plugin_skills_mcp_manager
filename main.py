@@ -1065,7 +1065,9 @@ def _validate_and_update_from_zip(
             # Best-effort replacement: move current to backup, then replace
             import uuid as _uuid
 
-            backup_dir = skill_dir.parent / f".{skill_dir.name}.bak.{_uuid.uuid4().hex[:8]}"
+            backup_dir = (
+                skill_dir.parent / f".{skill_dir.name}.bak.{_uuid.uuid4().hex[:8]}"
+            )
             rollback_failed = False
             try:
                 # Move current to backup (fast rename, unique path avoids
