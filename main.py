@@ -935,6 +935,7 @@ class Main(star.Star):
 
             # Disable old if running
             was_active = current_config.get("active", True)
+            was_running = name in tool_mgr.mcp_server_runtime_view
             if was_active:
                 try:
                     await tool_mgr.disable_mcp_server(name)
@@ -955,7 +956,7 @@ class Main(star.Star):
                     )
                     controller.stop()
                     return
-                if was_active:
+                if was_running:
                     try:
                         await tool_mgr.enable_mcp_server(
                             name, current_config, timeout=30
@@ -983,7 +984,7 @@ class Main(star.Star):
                         )
                         controller.stop()
                         return
-                    if was_active:
+                    if was_running:
                         try:
                             await tool_mgr.enable_mcp_server(
                                 name, current_config, timeout=30
@@ -1058,12 +1059,13 @@ def _validate_and_update_from_zip(
             src_dir = Path(tmp_dir) / zip_skill_name
 
             # Best-effort replacement: move current to backup, then replace
-            backup_dir = skill_dir.parent / f".{skill_dir.name}.bak"
+            import uuid as _uuid
+
+            backup_dir = skill_dir.parent / f".{skill_dir.name}.bak.{_uuid.uuid4().hex[:8]}"
             rollback_failed = False
             try:
-                # Move current to backup (fast rename)
-                if backup_dir.exists():
-                    shutil.rmtree(backup_dir)
+                # Move current to backup (fast rename, unique path avoids
+                # discarding a prior backup from a failed rollback)
                 shutil.move(skill_dir, backup_dir)
                 skill_dir.mkdir()
 
