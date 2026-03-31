@@ -13,28 +13,12 @@ from astrbot.core.agent.tool import ToolExecResult
 from astrbot.core.astr_agent_context import AstrAgentContext
 from astrbot.core.provider.func_tool_manager import FunctionToolManager
 
+from .utils import MAX_DIFF_TARGET_LEN, mask_sensitive
+
 _REFRESH_HINT = (
     "提示: 本次会话工具集为快照，变更需下一次请求生效；请发送一条新消息刷新。"
 )
 _MCP_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
-
-# Sensitive keys whose values should be masked in output
-_SENSITIVE_KEYS = frozenset(
-    {
-        "api_key",
-        "apikey",
-        "token",
-        "secret",
-        "password",
-        "authorization",
-        "auth",
-        "credential",
-        "credentials",
-        "private_key",
-        "access_token",
-        "refresh_token",
-    }
-)
 
 
 def _ensure_admin(context: ContextWrapper[AstrAgentContext]) -> str | None:
@@ -75,26 +59,6 @@ def _ok(data: Any = None, message: str = "") -> str:
 
 def _err(error: str) -> str:
     return json.dumps({"ok": False, "error": error}, ensure_ascii=False)
-
-
-def _mask_sensitive(config: dict) -> dict:
-    """Mask sensitive values in MCP config for safe display."""
-
-    def _process(d: dict) -> dict:
-        result = {}
-        for k, v in d.items():
-            if isinstance(v, dict):
-                result[k] = _process(v)
-            elif any(s in k.lower() for s in _SENSITIVE_KEYS):
-                if isinstance(v, str) and len(v) > 4:
-                    result[k] = v[:2] + "***" + v[-2:]
-                else:
-                    result[k] = "***"
-            else:
-                result[k] = v
-        return result
-
-    return _process(config)
 
 
 def _get_tool_mgr(
@@ -182,7 +146,7 @@ class ListMcpServersTool(FunctionTool):
             return _ok(data={"servers": servers})
         except Exception as e:
             logger.error(f"list_mcp_servers failed: {e}")
-            return _err(f"列出失败: {type(e).__name__}: {e}")
+            return _err("列出 MCP 服务器失败，请稍后重试。")
 
 
 # ---------------------------------------------------------------------------
@@ -196,7 +160,7 @@ class GetMcpServerConfigTool(FunctionTool):
 
     name: str = "get_mcp_server_config"
     description: str = (
-        "获取指定 MCP 服务器的详细配置信息。无需管理员权限。敏感信息会被脱敏。"
+        "获取指定 MCP 服务器的详细配置信息。需要管理员权限。敏感信息会被脱敏。"
     )
     parameters: dict = field(
         default_factory=lambda: {
@@ -217,6 +181,8 @@ class GetMcpServerConfigTool(FunctionTool):
         server_name: str = "",
         **kwargs: Any,
     ) -> ToolExecResult:
+        if err := _ensure_admin(context):
+            return err
         if err := _validate_mcp_name(server_name):
             return err
         try:
@@ -238,7 +204,7 @@ class GetMcpServerConfigTool(FunctionTool):
                 "status": (
                     "running" if is_running else ("enabled" if active else "disabled")
                 ),
-                "config": _mask_sensitive(server_config),
+                "config": mask_sensitive(server_config),
             }
 
             if is_running:
@@ -248,7 +214,7 @@ class GetMcpServerConfigTool(FunctionTool):
             return _ok(data=result)
         except Exception as e:
             logger.error(f"get_mcp_server_config failed: {e}")
-            return _err(f"获取配置失败: {type(e).__name__}: {e}")
+            return _err("获取配置失败，请稍后重试。")
 
 
 # ---------------------------------------------------------------------------
@@ -303,7 +269,7 @@ class EnableMcpServerTool(FunctionTool):
             server_config["active"] = True
             config["mcpServers"][server_name] = server_config
             if not tool_mgr.save_mcp_config(config):
-                return _err("已启用但保存配置失败，重启后可能回退。")
+                return _err("已启用但保存配置失败，重启后需要手动重新启用。")
 
             return _ok(message=f"已启用 MCP 服务器: {server_name}。{_REFRESH_HINT}")
         except TimeoutError:
@@ -312,7 +278,7 @@ class EnableMcpServerTool(FunctionTool):
             )
         except Exception as e:
             logger.error(f"enable_mcp_server failed: {e}")
-            return _err(f"启用失败: {type(e).__name__}: {e}")
+            return _err("启用失败。请检查服务器配置和可用性。")
 
 
 # ---------------------------------------------------------------------------
@@ -366,14 +332,14 @@ class DisableMcpServerTool(FunctionTool):
             # Update config after successful disable
             servers[server_name]["active"] = False
             if not tool_mgr.save_mcp_config(config):
-                return _err("已禁用但保存配置失败，重启后可能回退。")
+                return _err("已禁用但保存配置失败，重启后需要手动重新禁用。")
 
             return _ok(message=f"已禁用 MCP 服务器: {server_name}。{_REFRESH_HINT}")
         except TimeoutError:
             return _err(f"禁用 MCP 服务器 {server_name} 超时。")
         except Exception as e:
             logger.error(f"disable_mcp_server failed: {e}")
-            return _err(f"禁用失败: {type(e).__name__}: {e}")
+            return _err("禁用失败。请稍后重试。")
 
 
 # ---------------------------------------------------------------------------
@@ -460,7 +426,7 @@ class AddMcpServerTool(FunctionTool):
             return _ok(message=f"MCP 服务器 '{server_name}' 添加成功！{_REFRESH_HINT}")
         except Exception as e:
             logger.error(f"add_mcp_server failed: {e}")
-            return _err(f"添加失败: {type(e).__name__}: {e}")
+            return _err("添加失败。请检查配置格式和服务器可用性。")
 
 
 # ---------------------------------------------------------------------------
@@ -491,6 +457,8 @@ _MCP_DIFF_DESC = (
     "请提供要替换的原始配置文本片段和替换后的文本。"
     "系统会在当前 JSON 配置中查找原始文本并验证匹配度，匹配成功后执行替换。"
     "替换后会自动测试新配置连接。"
+    f"注意: target_content 最大长度为 {MAX_DIFF_TARGET_LEN} 字符。"
+    "如果需要修改的内容较多，请分多次调用，每次只替换一个片段。"
 )
 _MCP_DIFF_PARAMS: dict = {
     "type": "object",
@@ -577,7 +545,8 @@ class UpdateMcpServerTool(FunctionTool):
 
             # Disable old server if running
             was_active = old_config.get("active", True)
-            if was_active and server_name in tool_mgr.mcp_server_runtime_view:
+            was_running = server_name in tool_mgr.mcp_server_runtime_view
+            if was_active and was_running:
                 try:
                     await tool_mgr.disable_mcp_server(server_name, timeout=10)
                 except Exception:
@@ -586,14 +555,44 @@ class UpdateMcpServerTool(FunctionTool):
             # Save new config
             mcp_config["mcpServers"][server_name] = config
             if not tool_mgr.save_mcp_config(mcp_config):
-                return _err("保存配置失败。")
+                # Rollback: restore old config
+                mcp_config["mcpServers"][server_name] = old_config
+                if not tool_mgr.save_mcp_config(mcp_config):
+                    logger.error(
+                        f"update_mcp_server: rollback save also failed for {server_name}"
+                    )
+                    return _err("保存配置失败，且回滚也未成功，请手动检查配置文件。")
+                if was_running:
+                    try:
+                        await tool_mgr.enable_mcp_server(
+                            server_name, old_config, timeout=30
+                        )
+                    except Exception:
+                        pass
+                return _err("保存配置失败，已回滚旧配置。")
 
             # Re-enable with new config if should be active
             if config.get("active", True):
                 try:
                     await tool_mgr.enable_mcp_server(server_name, config, timeout=30)
-                except Exception as e:
-                    return _err(f"配置已保存但启用失败: {e}。请检查配置。")
+                except Exception:
+                    # Rollback: restore old config and re-enable
+                    mcp_config["mcpServers"][server_name] = old_config
+                    if not tool_mgr.save_mcp_config(mcp_config):
+                        logger.error(
+                            f"update_mcp_server: rollback save failed for {server_name}"
+                        )
+                        return _err(
+                            "启用新配置失败，且回滚也未成功，请手动检查配置文件。"
+                        )
+                    if was_running:
+                        try:
+                            await tool_mgr.enable_mcp_server(
+                                server_name, old_config, timeout=30
+                            )
+                        except Exception:
+                            pass
+                    return _err("启用新配置失败，已回滚旧配置。请检查配置。")
 
             msg = f"MCP 服务器 '{server_name}' 更新成功！{_REFRESH_HINT}"
             if self.diff_mode and match_info:
@@ -601,7 +600,7 @@ class UpdateMcpServerTool(FunctionTool):
             return _ok(message=msg)
         except Exception as e:
             logger.error(f"update_mcp_server failed: {e}")
-            return _err(f"更新失败: {type(e).__name__}: {e}")
+            return _err("更新失败。请检查配置格式和服务器可用性。")
 
     def _resolve_diff(
         self,
@@ -614,6 +613,10 @@ class UpdateMcpServerTool(FunctionTool):
 
         if not target_content:
             return "target_content 不能为空。", None
+
+        # Input length limit to prevent performance issues
+        if len(target_content) > MAX_DIFF_TARGET_LEN:
+            return f"target_content 超出长度限制 ({MAX_DIFF_TARGET_LEN} 字符)。", None
 
         # Serialize old config to formatted JSON for diff
         config_text = json.dumps(old_config, ensure_ascii=False, indent=2)
@@ -744,4 +747,4 @@ class RemoveMcpServerTool(FunctionTool):
             return _ok(message=f"已移除 MCP 服务器: {server_name}。{_REFRESH_HINT}")
         except Exception as e:
             logger.error(f"remove_mcp_server failed: {e}")
-            return _err(f"移除失败: {type(e).__name__}: {e}")
+            return _err("移除失败。请稍后重试。")

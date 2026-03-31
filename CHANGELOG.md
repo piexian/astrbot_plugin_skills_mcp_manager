@@ -2,6 +2,27 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [0.1.7] - 2026-03-31
+
+### Security
+- **管理员权限扩展**：`list_skill_files`、`read_skill_file` 工具和 `/skill files`、`/skill read` 命令新增管理员校验
+- **MCP 名称校验**：`/mcp config`、`/mcp update` 命令新增 `_MCP_NAME_RE` 名称白名单校验
+- **配置持久化校验**：`mcp_on`、`mcp_off`、`mcp_del` 命令检查 `save_mcp_config()` 返回值，保存失败时报错
+- **MCP 更新回滚**：`/mcp update` 命令和 `UpdateMcpServerTool` 启用失败时自动恢复旧配置并重新启用旧服务
+- **原子 ZIP 更新**：`_validate_and_update_from_zip` 在覆盖前备份现有文件，复制失败时自动回滚
+- **ZIP 名称预校验**：`UpdateSkillFromZipTool` 在覆盖前验证 ZIP 内 Skill 名与目标一致，防止误写
+- **敏感信息脱敏增强**：`_mask_sensitive_config` / `_mask_sensitive` 递归处理嵌套列表
+- **错误信息脱敏**：所有工具的异常消息改为通用描述，内部细节仅输出到日志
+- **Diff 性能防护**：`target_content` 设有 50000 字符长度上限，防止大文本拖慢
+
+### Changed
+- **纯文本状态标签**：移除所有 emoji，使用 `[成功]` `[失败]` `[警告]` `[运行中]` `[已启用]` `[已禁用]` 等纯文本标签
+- **Diff 编辑提示**：工具描述中新增 `target_content` 长度上限提示，引导 AI 分次调用
+- **批量文件处理**：`/skill install` 和 `/skill update` 支持单消息包含多个 ZIP 文件
+
+### Fixed
+- `/skill install`、`/skill update` 命令处理同一消息中的所有附件文件，不再只取第一个
+
 ## [0.1.6] - 2026-03-26
 
 ### Added
