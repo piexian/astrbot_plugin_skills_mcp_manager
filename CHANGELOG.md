@@ -2,6 +2,11 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [0.1.8] - 2026-05-02
+
+### Added
+- 新增插件 Logo。
+
 ## [0.1.7] - 2026-03-31
 
 ### Security
