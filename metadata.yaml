@@ -1,10 +1,10 @@
 name: astrbot_plugin_skills_mcp_manager
 display_name: Skills & MCP 管理器
-version: 0.1.8
+version: 0.1.9
 description: 为astrbot提供函数工具和指令来管理 AstrBot Skills 和 MCP 服务器。
 author: piexian
 repo: https://github.com/piexian/astrbot_plugin_skills_mcp_manager
 
 support_platforms: []
 
-astrbot_version: ">=4.13.2"
+astrbot_version: ">=4.23.6"

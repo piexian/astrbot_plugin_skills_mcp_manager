@@ -27,12 +27,9 @@ from .tools import (
     GetMcpServerConfigTool,
     InstallSkillTool,
     ListMcpServersTool,
-    ListSkillFilesTool,
     ListSkillsTool,
-    ReadSkillFileTool,
     RemoveMcpServerTool,
     UpdateMcpServerTool,
-    UpdateSkillFileTool,
     UpdateSkillFromZipTool,
 )
 
@@ -65,12 +62,6 @@ class Main(star.Star):
             DisableSkillTool(),
             DeleteSkillTool(),
             InstallSkillTool(),
-            ListSkillFilesTool(),
-            ReadSkillFileTool(),
-            UpdateSkillFileTool(
-                diff_mode=diff_mode,
-                diff_match_threshold=diff_threshold,
-            ),
             UpdateSkillFromZipTool(),
             # MCP tools
             ListMcpServersTool(),

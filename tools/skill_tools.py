@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,13 +18,15 @@ from astrbot.core.astr_agent_context import AstrAgentContext
 from astrbot.core.skills.skill_manager import SkillManager
 from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
 
-from .utils import MAX_DIFF_TARGET_LEN
-
 _SKILL_NAME_RE = re.compile(r"^[\w.-]+$")
 
 _REFRESH_HINT = (
     "提示: 本次会话工具集为快照，变更需下一次请求生效；请发送一条新消息刷新。"
 )
+
+
+class SkillZipPathError(RuntimeError):
+    """Raised when a ZIP path cannot be resolved from local or sandbox storage."""
 
 
 def _ensure_admin(context: ContextWrapper[AstrAgentContext]) -> str | None:
@@ -64,6 +67,11 @@ def _ok(data: Any = None, message: str = "") -> str:
 
 def _err(error: str) -> str:
     return json.dumps({"ok": False, "error": error}, ensure_ascii=False)
+
+
+def _unknown_err(prefix: str, exc: Exception) -> str:
+    detail = str(exc).strip() or exc.__class__.__name__
+    return _err(f"{prefix}: {detail}")
 
 
 def _get_skill_manager() -> SkillManager:
@@ -115,8 +123,74 @@ async def _resolve_zip_path(
     tmp_dir = get_astrbot_temp_path()
     os.makedirs(tmp_dir, exist_ok=True)
     tmp_file = os.path.join(tmp_dir, f"skill_install_{uuid.uuid4().hex[:8]}.zip")
-    await booter.download_file(zip_path, tmp_file)
+    try:
+        await _download_sandbox_zip(booter, zip_path, tmp_file)
+    except SkillZipPathError:
+        raise
+    except Exception as exc:
+        raise SkillZipPathError(
+            f"无法从沙盒下载 ZIP 文件: {zip_path}。"
+            "请确认文件存在，并且路径位于当前沙盒工作区内。"
+        ) from exc
     return tmp_file, tmp_file
+
+
+async def _download_sandbox_zip(booter: Any, remote_path: str, local_path: str) -> None:
+    try:
+        await booter.download_file(remote_path, local_path)
+        return
+    except Exception as exc:
+        if not _is_workspace_path_error(exc):
+            raise
+
+        try:
+            fixed_path = await _prepare_workspace_download_path(booter, remote_path)
+        except Exception as fix_exc:
+            raise SkillZipPathError(
+                f"沙盒 ZIP 路径不可访问: {remote_path}。"
+                "旧版 Shipyard 需要 workspace 内真实路径，但自动解析失败。"
+            ) from fix_exc
+        if not fixed_path or fixed_path == remote_path:
+            raise
+        try:
+            await booter.download_file(fixed_path, local_path)
+        except Exception as retry_exc:
+            raise SkillZipPathError(
+                f"沙盒 ZIP 文件下载失败: {remote_path}。"
+                "请将 ZIP 放在当前沙盒工作区内后再安装。"
+            ) from retry_exc
+
+
+def _is_workspace_path_error(exc: Exception) -> bool:
+    message = str(exc)
+    return (
+        "path must be within workspace" in message
+        or "Access denied" in message
+        or "Ship returned 403" in message
+    )
+
+
+async def _prepare_workspace_download_path(booter: Any, remote_path: str) -> str:
+    quoted_path = shlex.quote(remote_path)
+    copy_name = f"skill_install_{uuid.uuid4().hex[:8]}.zip"
+    quoted_copy_name = shlex.quote(copy_name)
+    command = (
+        "set -e; "
+        f"resolved=$(realpath {quoted_path}); "
+        'case "$resolved" in '
+        "*/workspace/*) printf '%s\\n' \"$resolved\" ;; "
+        f'*) cp "$resolved" {quoted_copy_name}; realpath {quoted_copy_name} ;; '
+        "esac"
+    )
+    result = await booter.shell.exec(command)
+    stdout = str(result.get("stdout") or result.get("output") or "").strip()
+    stderr = str(result.get("stderr") or result.get("error") or "").strip()
+    success = result.get("success")
+    if success is False or not stdout:
+        raise RuntimeError(
+            "无法解析沙盒 ZIP 路径" + (f": {stderr}" if stderr else f": {remote_path}")
+        )
+    return stdout.splitlines()[-1].strip()
 
 
 # ---------------------------------------------------------------------------
@@ -350,7 +424,7 @@ class InstallSkillTool(FunctionTool):
         try:
             actual_zip_path, tmp_file = await _resolve_zip_path(zip_path, context)
             mgr = _get_skill_manager()
-            install_kwargs: dict[str, Any] = {}
+            install_kwargs: dict[str, Any] = {"overwrite": False}
             if skill_name_hint:
                 install_kwargs["skill_name_hint"] = skill_name_hint
             try:
@@ -358,381 +432,39 @@ class InstallSkillTool(FunctionTool):
                     actual_zip_path, **install_kwargs
                 )
             except TypeError:
-                # Backward compatibility: older SkillManager without skill_name_hint
-                skill_name = mgr.install_skill_from_zip(actual_zip_path)
+                # Backward compatibility: older SkillManager without overwrite/name hints
+                legacy_kwargs = {
+                    key: value
+                    for key, value in install_kwargs.items()
+                    if key != "overwrite"
+                }
+                try:
+                    skill_name = mgr.install_skill_from_zip(
+                        actual_zip_path, **legacy_kwargs
+                    )
+                except TypeError:
+                    skill_name = mgr.install_skill_from_zip(actual_zip_path)
             _try_sync_to_sandboxes()
             return _ok(
                 data={"skill_name": skill_name},
                 message=f"Skill 安装成功: {skill_name}。{_REFRESH_HINT}",
             )
+        except SkillZipPathError as e:
+            logger.error(f"install_skill failed: {e}")
+            return _err(str(e))
         except FileExistsError:
             return _err(
                 "同名 Skill 已存在，请先删除或使用 update_skill_from_zip 更新。"
             )
         except Exception as e:
-            logger.error(f"install_skill failed: {e}")
-            return _err("安装 Skill 失败。请检查 ZIP 文件格式是否正确。")
+            logger.exception(f"install_skill failed: {e}")
+            return _unknown_err("安装 Skill 失败", e)
         finally:
             if tmp_file and os.path.exists(tmp_file):
                 try:
                     os.remove(tmp_file)
                 except OSError:
                     pass
-
-
-# ---------------------------------------------------------------------------
-# ListSkillFilesTool
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class ListSkillFilesTool(FunctionTool):
-    """List the file structure of a specified Skill."""
-
-    name: str = "list_skill_files"
-    description: str = (
-        "列出指定 Skill 的文件结构。需要管理员权限。返回 Skill 目录下的所有文件列表。"
-    )
-    parameters: dict = field(
-        default_factory=lambda: {
-            "type": "object",
-            "properties": {
-                "skill_name": {
-                    "type": "string",
-                    "description": "Skill 名称",
-                }
-            },
-            "required": ["skill_name"],
-        }
-    )
-
-    async def call(
-        self,
-        context: ContextWrapper[AstrAgentContext],
-        skill_name: str = "",
-        **kwargs: Any,
-    ) -> ToolExecResult:
-        if err := _ensure_admin(context):
-            return err
-        if err := _validate_skill_name(skill_name):
-            return err
-        try:
-            mgr = _get_skill_manager()
-            skills_root = Path(mgr.skills_root)
-            skill_dir = skills_root / skill_name
-            if not skill_dir.exists():
-                return _err(f"Skill 不存在: {skill_name}")
-
-            files: list[dict[str, Any]] = []
-            for root, _dirs, filenames in os.walk(skill_dir):
-                for fname in filenames:
-                    fpath = Path(root) / fname
-                    rel = fpath.relative_to(skill_dir)
-                    files.append(
-                        {
-                            "path": str(rel).replace("\\", "/"),
-                            "size": fpath.stat().st_size,
-                        }
-                    )
-            return _ok(data={"skill_name": skill_name, "files": files})
-        except Exception as e:
-            logger.error(f"list_skill_files failed: {e}")
-            return _err("列出文件失败。请检查 Skill 名称是否正确。")
-
-
-# ---------------------------------------------------------------------------
-# ReadSkillFileTool
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class ReadSkillFileTool(FunctionTool):
-    """Read the content of a file in a specified Skill."""
-
-    name: str = "read_skill_file"
-    description: str = (
-        "读取指定 Skill 中的文件内容。需要管理员权限。"
-        "可用于读取 SKILL.md 或其他脚本文件。"
-    )
-    parameters: dict = field(
-        default_factory=lambda: {
-            "type": "object",
-            "properties": {
-                "skill_name": {
-                    "type": "string",
-                    "description": "Skill 名称",
-                },
-                "file_path": {
-                    "type": "string",
-                    "description": "相对文件路径（如 SKILL.md, scripts/run.sh）",
-                },
-            },
-            "required": ["skill_name", "file_path"],
-        }
-    )
-
-    async def call(
-        self,
-        context: ContextWrapper[AstrAgentContext],
-        skill_name: str = "",
-        file_path: str = "",
-        **kwargs: Any,
-    ) -> ToolExecResult:
-        if err := _ensure_admin(context):
-            return err
-        if err := _validate_skill_name(skill_name):
-            return err
-        if not file_path:
-            return _err("file_path 不能为空。")
-
-        try:
-            mgr = _get_skill_manager()
-            skills_root = Path(mgr.skills_root)
-            skill_dir = (skills_root / skill_name).resolve()
-            target = (skill_dir / file_path).resolve()
-
-            # Security check: ensure path stays within the specific skill directory
-            try:
-                target.relative_to(skill_dir)
-            except ValueError:
-                return _err("非法文件路径: 不允许访问该 Skill 目录外的文件。")
-
-            if not target.exists():
-                return _err(f"文件不存在: {file_path}")
-            if not target.is_file():
-                return _err(f"'{file_path}' 不是文件。")
-
-            content = target.read_text(encoding="utf-8")
-            if len(content) > 10000:
-                content = content[:10000] + "\n\n... (内容过长，已截断至 10000 字符)"
-            return _ok(
-                data={
-                    "skill_name": skill_name,
-                    "file_path": file_path,
-                    "content": content,
-                }
-            )
-        except Exception as e:
-            logger.error(f"read_skill_file failed: {e}")
-            return _err("读取文件失败。请检查文件路径是否正确。")
-
-
-# ---------------------------------------------------------------------------
-# UpdateSkillFileTool
-# ---------------------------------------------------------------------------
-
-_FULL_REPLACE_DESC = (
-    "更新指定 Skill 中的文件内容（全文覆盖模式）。需要管理员权限。用于修改 SKILL.md 或脚本文件。"
-    "传入完整的文件内容以覆盖目标文件。"
-)
-_FULL_REPLACE_PARAMS: dict = {
-    "type": "object",
-    "properties": {
-        "skill_name": {
-            "type": "string",
-            "description": "Skill 名称",
-        },
-        "file_path": {
-            "type": "string",
-            "description": "相对文件路径（如 SKILL.md, scripts/run.sh）",
-        },
-        "content": {
-            "type": "string",
-            "description": "完整的文件内容",
-        },
-    },
-    "required": ["skill_name", "file_path", "content"],
-}
-
-_DIFF_DESC = (
-    "更新指定 Skill 中的文件内容（Diff 模式）。需要管理员权限。"
-    "请提供要替换的原始文本片段和替换后的文本。"
-    "系统会在文件中查找原始文本并验证匹配度，匹配成功后执行替换。"
-    "文件必须已存在。"
-    f"注意: target_content 最大长度为 {MAX_DIFF_TARGET_LEN} 字符。"
-    "如果需要修改的内容较多，请分多次调用，每次只替换一个片段。"
-)
-_DIFF_PARAMS: dict = {
-    "type": "object",
-    "properties": {
-        "skill_name": {
-            "type": "string",
-            "description": "Skill 名称",
-        },
-        "file_path": {
-            "type": "string",
-            "description": "相对文件路径（如 SKILL.md, scripts/run.sh）",
-        },
-        "target_content": {
-            "type": "string",
-            "description": "要替换的原始文本片段（需与文件中的内容匹配）",
-        },
-        "replacement_content": {
-            "type": "string",
-            "description": "替换后的新文本",
-        },
-    },
-    "required": ["skill_name", "file_path", "target_content", "replacement_content"],
-}
-
-
-@dataclass
-class UpdateSkillFileTool(FunctionTool):
-    """Update the content of a file in a specified Skill."""
-
-    name: str = "update_skill_file"
-    description: str = _FULL_REPLACE_DESC
-    parameters: dict = field(default_factory=lambda: _FULL_REPLACE_PARAMS.copy())
-
-    # Diff mode settings (injected at init time from plugin config)
-    diff_mode: bool = False
-    diff_match_threshold: int = 100
-
-    def __post_init__(self) -> None:
-        if self.diff_mode:
-            self.description = _DIFF_DESC
-            self.parameters = _DIFF_PARAMS.copy()
-
-    async def call(
-        self,
-        context: ContextWrapper[AstrAgentContext],
-        skill_name: str = "",
-        file_path: str = "",
-        content: str = "",
-        target_content: str = "",
-        replacement_content: str = "",
-        **kwargs: Any,
-    ) -> ToolExecResult:
-        if err := _ensure_admin(context):
-            return err
-        if err := _validate_skill_name(skill_name):
-            return err
-        if not file_path:
-            return _err("file_path 不能为空。")
-
-        try:
-            mgr = _get_skill_manager()
-            skills_root = Path(mgr.skills_root)
-            skill_dir = (skills_root / skill_name).resolve()
-
-            if not skill_dir.exists():
-                return _err(f"Skill 不存在: {skill_name}")
-
-            target = (skill_dir / file_path).resolve()
-
-            # Security check: ensure path stays within the specific skill directory
-            try:
-                target.relative_to(skill_dir)
-            except ValueError:
-                return _err("非法文件路径: 不允许写入该 Skill 目录外的文件。")
-
-            if self.diff_mode:
-                return self._apply_diff(
-                    target, skill_name, file_path, target_content, replacement_content
-                )
-            else:
-                return self._apply_full_replace(target, skill_name, file_path, content)
-        except Exception as e:
-            logger.error(f"update_skill_file failed: {e}")
-            return _err("更新文件失败。请检查文件路径和内容。")
-
-    def _apply_full_replace(
-        self, target: Path, skill_name: str, file_path: str, content: str
-    ) -> str:
-        """Full file replacement mode."""
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
-        return _ok(message=f"已更新文件: {skill_name}/{file_path}。{_REFRESH_HINT}")
-
-    def _apply_diff(
-        self,
-        target: Path,
-        skill_name: str,
-        file_path: str,
-        target_content: str,
-        replacement_content: str,
-    ) -> str:
-        """Diff-based replacement mode with match validation."""
-        import difflib
-
-        if not target_content:
-            return _err("target_content 不能为空。")
-
-        # Input length limit to prevent performance issues
-        if len(target_content) > MAX_DIFF_TARGET_LEN:
-            return _err(f"target_content 超出长度限制 ({MAX_DIFF_TARGET_LEN} 字符)。")
-
-        if not target.exists():
-            return _err(
-                f"文件不存在: {file_path}。Diff 模式不支持创建新文件，请使用全文模式。"
-            )
-
-        file_text = target.read_text(encoding="utf-8")
-        threshold = self.diff_match_threshold / 100.0
-
-        # Try exact match first (fast path)
-        if target_content in file_text:
-            new_text = file_text.replace(target_content, replacement_content, 1)
-            target.write_text(new_text, encoding="utf-8")
-            return _ok(
-                data={"match_ratio": 100},
-                message=(
-                    f"已更新文件: {skill_name}/{file_path}（精确匹配）。{_REFRESH_HINT}"
-                ),
-            )
-
-        # Fuzzy match using SequenceMatcher
-        best_ratio = 0.0
-        best_start = 0
-        best_end = 0
-        target_len = len(target_content)
-
-        # Sliding window: search for the best matching substring
-        # Use SequenceMatcher to find the best match position
-        sm = difflib.SequenceMatcher(None, file_text, target_content, autojunk=False)
-        blocks = sm.get_matching_blocks()
-
-        # Try windows around each matching block anchor
-        for block in blocks:
-            if block.size == 0:
-                continue
-            # Try different window sizes around this anchor
-            anchor_start = block.a
-            for offset in range(
-                -target_len, target_len // 2 + 1, max(1, target_len // 20)
-            ):
-                start = max(0, anchor_start + offset)
-                end = min(len(file_text), start + target_len)
-                if end - start < target_len // 2:
-                    continue
-                candidate = file_text[start:end]
-                ratio = difflib.SequenceMatcher(
-                    None, candidate, target_content, autojunk=False
-                ).ratio()
-                if ratio > best_ratio:
-                    best_ratio = ratio
-                    best_start = start
-                    best_end = end
-
-        match_pct = int(best_ratio * 100)
-
-        if best_ratio < threshold:
-            return _err(
-                f"匹配失败: 最佳匹配度 {match_pct}%，"
-                f"要求 {self.diff_match_threshold}%。"
-                f"请检查 target_content 是否与文件内容一致。"
-            )
-
-        # Apply replacement
-        new_text = file_text[:best_start] + replacement_content + file_text[best_end:]
-        target.write_text(new_text, encoding="utf-8")
-        return _ok(
-            data={"match_ratio": match_pct},
-            message=(
-                f"已更新文件: {skill_name}/{file_path}"
-                f"（匹配度: {match_pct}%）。{_REFRESH_HINT}"
-            ),
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -856,9 +588,12 @@ class UpdateSkillFromZipTool(FunctionTool):
                 data={"skill_name": installed_name},
                 message=f"已从 ZIP 更新 Skill: {installed_name}。{_REFRESH_HINT}",
             )
-        except Exception as e:
+        except SkillZipPathError as e:
             logger.error(f"update_skill_from_zip failed: {e}")
-            return _err("从 ZIP 更新 Skill 失败。请检查 ZIP 文件格式是否正确。")
+            return _err(str(e))
+        except Exception as e:
+            logger.exception(f"update_skill_from_zip failed: {e}")
+            return _unknown_err("从 ZIP 更新 Skill 失败", e)
         finally:
             if tmp_file and os.path.exists(tmp_file):
                 try:

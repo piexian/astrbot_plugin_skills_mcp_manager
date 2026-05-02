@@ -3,10 +3,7 @@ from .skill_tools import (
     DisableSkillTool,
     EnableSkillTool,
     InstallSkillTool,
-    ListSkillFilesTool,
     ListSkillsTool,
-    ReadSkillFileTool,
-    UpdateSkillFileTool,
     UpdateSkillFromZipTool,
 )
 from .mcp_tools import (
@@ -26,9 +23,6 @@ __all__ = [
     "DisableSkillTool",
     "DeleteSkillTool",
     "InstallSkillTool",
-    "ListSkillFilesTool",
-    "ReadSkillFileTool",
-    "UpdateSkillFileTool",
     "UpdateSkillFromZipTool",
     # MCP
     "ListMcpServersTool",
