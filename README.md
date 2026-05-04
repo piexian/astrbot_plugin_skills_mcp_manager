@@ -14,6 +14,7 @@
 ## 功能
 
 - 13 个 LLM Tool，覆盖 Skills 和 MCP 全生命周期管理
+- 支持国际化（中文 / English），Dashboard 根据当前语言自动切换
 - `/skill` 命令组，用户可直接通过指令管理 Skills
 - `/mcp` 命令组，用户可直接通过指令管理 MCP 服务器
 - 内置英文版 `skills-mcp-manager` Skill，引导 AI 正确调用管理工具
@@ -26,6 +27,12 @@
 ```
 https://github.com/piexian/astrbot_plugin_skills_mcp_manager
 ```
+
+> **内置 Skill 安装**：AstrBot >= 4.24.2 自动加载。低版本用户安装插件后，开启 Computer Use，对 AI 说：
+> ```
+> cp -r data/plugins/astrbot_plugin_skills_mcp_manager/skills/skills-mcp-manager data/skills/
+> ```
+> 沙盒模式路径隔离，无法直接 `cp`，建议切到本地模式执行，或通过 WebUI 手动上传。
 
 ## 工具列表
 
@@ -113,6 +120,10 @@ astrbot_plugin_skills_mcp_manager/
 ├── _conf_schema.json                # 插件配置 Schema
 ├── CHANGELOG.md
 ├── README.md
+├── .astrbot-plugin/
+│   └── i18n/
+│       ├── zh-CN.json               # 中文翻译
+│       └── en-US.json               # 英文翻译
 ├── tools/
 │   ├── __init__.py                  # 工具导出
 │   ├── skill_tools.py               # 6 个 Skills 管理 FunctionTool

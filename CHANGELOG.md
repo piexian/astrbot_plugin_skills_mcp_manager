@@ -2,6 +2,11 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [0.1.10] - 2026-05-04
+
+### Added
+- 新增 `.astrbot-plugin/i18n/zh-CN.json` 和 `en-US.json`，支持插件名称、描述和配置文本的国际化展示。
+
 ## [0.1.9] - 2026-05-02
 
 ### Changed

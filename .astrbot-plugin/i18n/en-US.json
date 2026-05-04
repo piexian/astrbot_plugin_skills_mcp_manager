@@ -1,0 +1,17 @@
+{
+  "metadata": {
+    "display_name": "Skills & MCP Manager",
+    "short_desc": "Management tools for AstrBot Skills and MCP servers",
+    "desc": "Provides function tools and commands for managing AstrBot Skills and MCP servers, including skill lifecycle management, MCP server configuration management, and a built-in management skill."
+  },
+  "config": {
+    "diff_mode": {
+      "description": "Edit Mode",
+      "hint": "When enabled, AI must provide original text and replacement text as a diff pair when editing MCP configurations, instead of full config replacement. This prevents AI from accidentally overwriting the entire configuration. For Skill file editing, use AstrBot's new built-in file tools."
+    },
+    "diff_match_threshold": {
+      "description": "Text Match Threshold",
+      "hint": "Percentage match required for MCP config original text matching. 100 means exact match required; lower values allow minor deviations in AI-provided original text. Only effective when Diff mode is enabled."
+    }
+  }
+}

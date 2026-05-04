@@ -1,0 +1,17 @@
+{
+  "metadata": {
+    "display_name": "Skills & MCP 管理器",
+    "short_desc": "为 AstrBot 提供 Skills 和 MCP 服务器的管理工具",
+    "desc": "为 AstrBot 提供函数工具和指令来管理 AstrBot Skills 和 MCP 服务器，支持 Skills 生命周期管理、MCP 服务器配置管理，以及内置管理 Skill。"
+  },
+  "config": {
+    "diff_mode": {
+      "description": "编辑模式",
+      "hint": "启用后，AI 编辑 MCP 配置时需要提供原始文本和替换文本的 diff 对，而非完整配置。可防止 AI 意外覆盖整个配置。Skill 文件编辑请使用 AstrBot 新版内置文件工具。"
+    },
+    "diff_match_threshold": {
+      "description": "文本匹配阈值",
+      "hint": "MCP 配置原始文本匹配度百分比。100 表示必须完全匹配，较低值允许 AI 提供的原始文本有少量偏差。仅在 Diff 模式启用时生效。"
+    }
+  }
+}

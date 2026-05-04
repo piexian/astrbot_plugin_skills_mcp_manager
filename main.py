@@ -51,9 +51,6 @@ class Main(star.Star):
         # Clamp to valid range [50, 100]
         diff_threshold = max(50, min(100, diff_threshold))
 
-        # Install builtin skill
-        self._install_builtin_skill()
-
         # Register LLM tools
         context.add_llm_tools(
             # Skills tools
@@ -75,38 +72,6 @@ class Main(star.Star):
             ),
             RemoveMcpServerTool(),
         )
-
-    def _install_builtin_skill(self) -> None:
-        """Install builtin SKILL.md to AstrBot skills directory."""
-        plugin_dir = Path(__file__).parent
-        builtin_skill_src = plugin_dir / "skills" / "skills-mcp-manager"
-        try:
-            mgr = SkillManager()
-            skills_root = Path(mgr.skills_root)
-            builtin_skill_dest = skills_root / "skills-mcp-manager"
-
-            if not builtin_skill_src.exists():
-                return
-
-            if not builtin_skill_dest.exists():
-                shutil.copytree(builtin_skill_src, builtin_skill_dest)
-                logger.info("已安装内置 Skill: skills-mcp-manager")
-            else:
-                # Check if update is needed
-                src_md = builtin_skill_src / "SKILL.md"
-                dest_md = builtin_skill_dest / "SKILL.md"
-                if (
-                    src_md.exists()
-                    and dest_md.exists()
-                    and src_md.stat().st_mtime > dest_md.stat().st_mtime
-                ):
-                    shutil.copytree(
-                        builtin_skill_src, builtin_skill_dest, dirs_exist_ok=True
-                    )
-                    logger.info("已更新内置 Skill: skills-mcp-manager")
-        except Exception as e:
-            logger.warning(f"安装内置 Skill 失败: {e}")
-
     # ==================== Utility methods ====================
 
     @staticmethod
