@@ -5,13 +5,25 @@
     "desc": "Provides function tools and commands for managing AstrBot Skills and MCP servers, including skill lifecycle management, MCP server configuration management, and a built-in management skill."
   },
   "config": {
+    "skill_confirm_timeout": {
+      "description": "Skill Command Confirmation Timeout (Seconds)",
+      "hint": "Wait for the exact reply 确认 after the report; timeout cancels installation."
+    },
+    "skill_review_provider_id": {
+      "description": "Skill Review Model (Optional)",
+      "hint": "Leave empty for the chat model; commands return the selected model's report directly."
+    },
+    "skill_scan_mode": {
+      "description": "Skill Static Scan Policy",
+      "hint": "AI tools: enforce blocks risks; report_only reports them."
+    },
     "diff_mode": {
       "description": "Edit Mode",
-      "hint": "When enabled, AI must provide original text and replacement text as a diff pair when editing MCP configurations, instead of full config replacement. This prevents AI from accidentally overwriting the entire configuration. For Skill file editing, use AstrBot's new built-in file tools."
+      "hint": "Edit MCP configuration with targeted replacements instead of full overwrites."
     },
     "diff_match_threshold": {
       "description": "Text Match Threshold",
-      "hint": "Percentage match required for MCP config original text matching. 100 means exact match required; lower values allow minor deviations in AI-provided original text. Only effective when Diff mode is enabled."
+      "hint": "Text similarity required for replacements; 100 means an exact match."
     }
   }
 }

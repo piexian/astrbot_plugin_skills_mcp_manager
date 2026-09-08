@@ -8,14 +8,22 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
+import time
 from pathlib import Path
 
 from astrbot.api import AstrBotConfig, logger, star
 from astrbot.api.event import AstrMessageEvent, MessageEventResult, filter
 from astrbot.core.skills.skill_manager import SkillManager
-from astrbot.core.utils.session_waiter import SessionController, session_waiter
+from astrbot.core.utils.session_waiter import (
+    SessionController,
+    SessionFilter,
+    session_waiter,
+)
 
+from .services.scan_delivery import ScanDelivery
+from .services.scan_review import ScanReview
+from .services.skill_install import SkillInstallService, failed_result
+from .tools.skill_tools import _try_sync_to_sandboxes
 from .tools.utils import mask_sensitive
 from .tools import (
     AddMcpServerTool,
@@ -37,6 +45,13 @@ _SKILL_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 _MCP_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
+class _SkillSessionFilter(SessionFilter):
+    def filter(self, event: AstrMessageEvent) -> str:
+        return json.dumps(
+            ["skills_mcp_install", event.unified_msg_origin, event.get_sender_id()]
+        )
+
+
 class Main(star.Star):
     """Skills & MCP Manager Plugin"""
 
@@ -44,6 +59,16 @@ class Main(star.Star):
         super().__init__(context)
         self.context = context
         self.config = config
+        self.skill_installer = SkillInstallService(
+            config.get("skill_scan_mode", "enforce")
+        )
+        self.scan_delivery = ScanDelivery(self)
+        self.scan_review = ScanReview(
+            context, config.get("skill_review_provider_id", "")
+        )
+        self.skill_confirm_timeout = max(
+            1, int(config.get("skill_confirm_timeout", 300))
+        )
 
         # Read diff mode settings
         diff_mode = bool(config.get("diff_mode", False))
@@ -58,8 +83,10 @@ class Main(star.Star):
             EnableSkillTool(),
             DisableSkillTool(),
             DeleteSkillTool(),
-            InstallSkillTool(),
-            UpdateSkillFromZipTool(),
+            InstallSkillTool(installer=self.skill_installer, reviewer=self.scan_review),
+            UpdateSkillFromZipTool(
+                installer=self.skill_installer, reviewer=self.scan_review
+            ),
             # MCP tools
             ListMcpServersTool(),
             GetMcpServerConfigTool(),
@@ -72,6 +99,69 @@ class Main(star.Star):
             ),
             RemoveMcpServerTool(),
         )
+
+    @filter.on_llm_request()
+    async def inject_skill_scan_reports(self, event: AstrMessageEvent, req) -> None:
+        await self.scan_delivery.inject_pending(event, req)
+
+    @filter.on_llm_response()
+    async def acknowledge_skill_scan_reports(
+        self, event: AstrMessageEvent, resp
+    ) -> None:
+        await self.scan_delivery.acknowledge_response(event, resp)
+
+    async def _prepare_skill_upload(
+        self,
+        event: AstrMessageEvent,
+        attachment,
+        *,
+        operation: str = "install",
+        skill_name: str = "",
+        force: bool = False,
+    ):
+        file_path = None
+        prepared = None
+        try:
+            if event.role != "admin":
+                result = failed_result(
+                    "只有管理员可以安装或更新 Skill。", code="permission_denied"
+                )
+            else:
+                file_path = await attachment.get_file()
+                result, prepared = await self.skill_installer.prepare(
+                    SkillManager(),
+                    file_path,
+                    operation=operation,
+                    skill_name=skill_name,
+                    file_name=attachment.name,
+                    archive_name=attachment.name,
+                    force=force,
+                )
+        except Exception:
+            logger.exception("Skill upload preparation failed")
+            result = failed_result("无法取得上传文件或初始化安装服务。")
+        finally:
+            if file_path and os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                except OSError:
+                    logger.warning("Could not remove temporary skill upload")
+        result = await self.scan_review.review(result)
+        if self.scan_review.provider_id:
+            review = result["model_review"]
+            if review["status"] == "completed":
+                await event.send(event.plain_result(review["opinion"]))
+            else:
+                await event.send(
+                    event.plain_result(
+                        "审查模型未返回报告，以下是静态检查结果：\n"
+                        + json.dumps(result, ensure_ascii=False, indent=2)
+                    )
+                )
+        else:
+            await self.scan_delivery.deliver(event, result)
+        return result, prepared
+
     # ==================== Utility methods ====================
 
     @staticmethod
@@ -269,222 +359,183 @@ class Main(star.Star):
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @skill_group.command("install")
-    async def skill_install(self, event: AstrMessageEvent) -> None:
-        """批量安装 Skill（支持多个 ZIP 文件）"""
-        import astrbot.api.message_components as Comp
-
-        event.set_result(
-            MessageEventResult().message(
-                "Skill 批量安装模式已启动\n"
-                "发送 ZIP 文件安装 Skill，发送「结束」或「done」完成安装\n"
-                "超时时间: 120 秒"
-            )
-        )
-
-        installed: list[tuple[str, str]] = []
-        failed: list[tuple[str, str]] = []
-
-        @session_waiter(timeout=120, record_history_chains=False)
-        async def file_waiter(
-            controller: SessionController, event: AstrMessageEvent
-        ) -> None:
-            nonlocal installed, failed
-            user_input = event.message_str.strip().lower()
-
-            if user_input in ("结束", "done", "end", "exit", "quit"):
-                if installed or failed:
-                    result = _format_install_result(installed, failed)
-                    await event.send(event.plain_result(result))
-                else:
-                    await event.send(
-                        event.plain_result("批量安装已结束，未安装任何 Skill")
-                    )
-                controller.stop()
-                return
-
-            has_files = False
-            for msg in event.get_messages():
-                if isinstance(msg, Comp.File):
-                    has_files = True
-                    file_name = msg.name
-                    if not file_name.lower().endswith(".zip"):
-                        await event.send(
-                            event.plain_result(
-                                f"[警告] {file_name}: 请发送 ZIP 格式的文件"
-                            )
-                        )
-                        continue
-
-                    file_path_str = await msg.get_file()
-                    try:
-                        mgr = SkillManager()
-                        result = mgr.install_skill_from_zip(file_path_str)
-                        installed.append((file_name, result))
-                        await event.send(
-                            event.plain_result(f"[成功] {file_name}: 安装成功")
-                        )
-                    except Exception as e:
-                        failed.append((file_name, str(e)))
-                        logger.error(f"skill_install failed for {file_name}: {e}")
-                        await event.send(
-                            event.plain_result(
-                                f"[失败] {file_name}: 安装失败，请查看日志"
-                            )
-                        )
-                    finally:
-                        if file_path_str and os.path.exists(file_path_str):
-                            os.remove(file_path_str)
-
-            if has_files:
-                controller.keep(timeout=120, reset_timeout=True)
-                return
-
-            if event.message_str.strip():
-                await event.send(
-                    event.plain_result("[警告] 请发送 ZIP 文件，或发送「结束」完成安装")
-                )
-            controller.keep(timeout=120, reset_timeout=True)
-
-        try:
-            await file_waiter(event)
-        except TimeoutError:
-            if installed or failed:
-                result = _format_install_result(installed, failed)
-                result = "超时自动结束\n\n" + result
-                event.set_result(MessageEventResult().message(result).use_t2i(False))
-            else:
-                event.set_result(MessageEventResult().message("超时，未收到任何文件"))
-        finally:
+    async def skill_install(self, event: AstrMessageEvent, force: str = "") -> None:
+        """上传 Skill，先审查再等待精确确认。"""
+        if force not in {"", "--force"}:
+            await event.send(event.plain_result("用法: /skill install [--force]"))
             event.stop_event()
+            return
+        await self._skill_upload_session(event, force=force == "--force")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @skill_group.command("update")
-    async def skill_update(self, event: AstrMessageEvent, name: str = "") -> None:
-        """更新 Skill 文件（交互式）"""
-        import astrbot.api.message_components as Comp
-
-        if not name:
-            event.set_result(MessageEventResult().message("用法: /skill update <名称>"))
+    async def skill_update(
+        self, event: AstrMessageEvent, name: str = "", force: str = ""
+    ) -> None:
+        """上传更新，审查后等待确认；强制模式仍需要确认。"""
+        if (
+            not name
+            or not _SKILL_NAME_RE.fullmatch(name)
+            or name in {".", ".."}
+            or force not in {"", "--force"}
+        ):
+            await event.send(event.plain_result("用法: /skill update <名称> [--force]"))
+            event.stop_event()
             return
-        if not _SKILL_NAME_RE.fullmatch(name):
-            event.set_result(MessageEventResult().message(f"[失败] 无效名称: {name}"))
-            return
-
-        mgr = SkillManager()
-        skills_root = Path(mgr.skills_root)
-        skill_dir = (skills_root / name).resolve()
-
-        if not skill_dir.exists():
-            event.set_result(
-                MessageEventResult().message(
-                    f"[失败] Skill 不存在: {name}\n使用 /skill install 安装新 Skill"
-                )
-            )
-            return
-
-        event.set_result(
-            MessageEventResult().message(
-                f"Skill 更新模式: {name}\n"
-                "发送 ZIP 文件覆盖整个 Skill，或发送单个文件更新指定文件\n"
-                "发送「结束」或「done」完成更新\n"
-                "超时时间: 120 秒"
-            )
+        await self._skill_upload_session(
+            event, skill_name=name, force=force == "--force"
         )
 
-        updated_files: list[tuple[str, str]] = []
-        errors: list[tuple[str, str]] = []
+    async def _skill_upload_session(
+        self, origin: AstrMessageEvent, *, skill_name: str = "", force: bool = False
+    ) -> None:
+        import astrbot.api.message_components as Comp
+
+        pending = []
+        phase = "upload"
+        deadline = 0.0
+        confirmed = False
+        confirmation_event = origin
+        sender = origin.get_sender_id()
+        umo = origin.unified_msg_origin
+
+        def discard():
+            for candidate in pending:
+                candidate.files.clear()
+                candidate.consumed = True
+            pending.clear()
 
         @session_waiter(timeout=120, record_history_chains=False)
-        async def file_waiter(
+        async def waiter(
             controller: SessionController, event: AstrMessageEvent
         ) -> None:
-            nonlocal updated_files, errors
-            user_input = event.message_str.strip().lower()
-
-            if user_input in ("结束", "done", "end", "exit", "quit"):
-                if updated_files or errors:
-                    result = _format_update_result(updated_files, errors)
-                    await event.send(event.plain_result(result))
-                else:
-                    await event.send(
-                        event.plain_result("更新模式已结束，未更新任何文件")
-                    )
+            nonlocal phase, deadline, confirmed, confirmation_event
+            if event.get_sender_id() != sender or event.unified_msg_origin != umo:
+                return
+            if event.role != "admin":
+                await event.send(event.plain_result("管理员权限已失效，取消安装。"))
                 controller.stop()
                 return
-
-            has_files = False
-            for msg in event.get_messages():
-                if isinstance(msg, Comp.File):
-                    has_files = True
-                    file_name = msg.name
-                    file_path_str = await msg.get_file()
-                    try:
-                        if file_name.lower().endswith(".zip"):
-                            count = _validate_and_update_from_zip(
-                                skill_dir, file_path_str, name
-                            )
-                            updated_files.append(
-                                (file_name, f"整个 Skill 已更新 ({count} 文件)")
-                            )
-                            await event.send(
-                                event.plain_result(
-                                    f"[成功] {file_name}: Skill 已从 ZIP 更新"
-                                )
-                            )
-                        else:
-                            dest_path = (skill_dir / file_name).resolve()
-                            # Security check: ensure path stays within skill dir
-                            try:
-                                dest_path.relative_to(skill_dir)
-                            except ValueError:
-                                errors.append((file_name, "非法文件名: 路径逃逸"))
-                                await event.send(
-                                    event.plain_result(
-                                        f"[失败] {file_name}: 非法文件名"
-                                    )
-                                )
-                                continue
-                            dest_path.parent.mkdir(parents=True, exist_ok=True)
-                            shutil.copy(file_path_str, dest_path)
-                            updated_files.append((file_name, "已更新"))
-                            await event.send(
-                                event.plain_result(f"[成功] {file_name}: 已更新")
-                            )
-                    except Exception as e:
-                        errors.append((file_name, str(e)))
-                        logger.error(f"skill_update failed for {file_name}: {e}")
-                        await event.send(
-                            event.plain_result(
-                                f"[失败] {file_name}: 更新失败，请查看日志"
-                            )
+            if phase == "confirm":
+                if time.monotonic() >= deadline:
+                    controller.stop(TimeoutError("确认超时"))
+                    return
+                # Do not trim, infer intent, accept synonyms, or extend the deadline.
+                messages = event.get_messages()
+                if (
+                    event.message_str != "确认"
+                    or any(not isinstance(msg, Comp.Plain) for msg in messages)
+                    or "".join(msg.text for msg in messages) != "确认"
+                ):
+                    await event.send(
+                        event.plain_result(
+                            "尚未安装。仅接受纯文本“确认”，其他回复不会延长确认期限。"
                         )
-                    finally:
-                        if file_path_str and os.path.exists(file_path_str):
-                            os.remove(file_path_str)
-
-            if has_files:
-                controller.keep(timeout=120, reset_timeout=True)
+                    )
+                    return
+                confirmed = True
+                confirmation_event = event
+                controller.stop()
                 return
-
-            if event.message_str.strip():
+            if event.message_str in {"结束", "取消", "done"}:
+                controller.stop()
+                return
+            attachments = [
+                msg for msg in event.get_messages() if isinstance(msg, Comp.File)
+            ]
+            if not attachments:
                 await event.send(
                     event.plain_result(
-                        "[警告] 请发送 ZIP 文件或单个文件，或发送「结束」完成更新"
+                        "请发送 ZIP 文件；更新也可发送单个文件。发送“取消”结束。"
                     )
                 )
-            controller.keep(timeout=120, reset_timeout=True)
+                return
+            for attachment in attachments:
+                if not skill_name and not attachment.name.lower().endswith(".zip"):
+                    await event.send(event.plain_result("安装仅支持 ZIP 文件。"))
+                    continue
+                controller.keep(timeout=120, reset_timeout=True)
+                operation = (
+                    ("replace" if attachment.name.lower().endswith(".zip") else "file")
+                    if skill_name
+                    else "install"
+                )
+                result, candidate = await self._prepare_skill_upload(
+                    event,
+                    attachment,
+                    operation=operation,
+                    skill_name=skill_name,
+                    force=force,
+                )
+                if controller.future.done():
+                    if candidate is not None:
+                        candidate.files.clear()
+                        candidate.consumed = True
+                    discard()
+                    return
+                if candidate is not None:
+                    pending.append(candidate)
+                else:
+                    await event.send(
+                        event.plain_result("该文件未进入待安装队列：" + result["error"])
+                    )
+            if not pending:
+                controller.stop()
+                return
+            names = [p.result["data"]["skill_name"] for p in pending]
+            await event.send(
+                event.plain_result(
+                    "尚未安装/更新。待确认内容："
+                    + "；".join(names)
+                    + ("\n强制模式：将忽略内容分析结果，但仍需确认。" if force else "")
+                    + f"\n请在 {self.skill_confirm_timeout} 秒内仅发送“确认”两字；超时不安装。"
+                )
+            )
+            if controller.future.done():
+                discard()
+                return
+            phase = "confirm"
+            deadline = time.monotonic() + self.skill_confirm_timeout
+            controller.keep(timeout=self.skill_confirm_timeout, reset_timeout=True)
 
         try:
-            await file_waiter(event)
-        except TimeoutError:
-            if updated_files or errors:
-                result = _format_update_result(updated_files, errors)
-                result = "超时自动结束\n\n" + result
-                event.set_result(MessageEventResult().message(result).use_t2i(False))
+            await origin.send(
+                origin.plain_result(
+                    (
+                        f"Skill 更新模式: {skill_name}"
+                        if skill_name
+                        else "Skill 安装模式"
+                    )
+                    + "\n请在 120 秒内上传文件。将先返回报告，再等待“确认”。"
+                    + (
+                        "\n已启用 --force，内容分析不阻断安装；路径和包结构检查仍执行。"
+                        if force
+                        else ""
+                    )
+                )
+            )
+            await waiter(origin, session_filter=_SkillSessionFilter())
+            if confirmed:
+                for candidate in pending:
+                    result = await self.skill_installer.commit(candidate)
+                    if result["ok"]:
+                        _try_sync_to_sandboxes()
+                    await confirmation_event.send(
+                        confirmation_event.plain_result(
+                            result.get("message") if result["ok"] else result["error"]
+                        )
+                    )
             else:
-                event.set_result(MessageEventResult().message("超时，未收到任何文件"))
+                await origin.send(
+                    origin.plain_result("操作已取消，未安装或更新 Skill。")
+                )
+        except TimeoutError:
+            await origin.send(
+                origin.plain_result("等待超时，未安装或更新 Skill。请重新发起命令。")
+            )
         finally:
-            event.stop_event()
+            discard()
+            origin.stop_event()
 
     # ==================== MCP Command Group ====================
 
@@ -973,124 +1024,3 @@ class Main(star.Star):
             event.set_result(MessageEventResult().message("操作超时，请重新发送命令"))
         finally:
             event.stop_event()
-
-
-# ==================== Helper functions ====================
-
-
-def _validate_and_update_from_zip(
-    skill_dir: Path, zip_path: str, expected_name: str
-) -> int:
-    """Validate ZIP and update Skill with best-effort backup and rollback, return number of files updated."""
-    import zipfile
-
-    with zipfile.ZipFile(zip_path) as zf:
-        names = [
-            n.replace("\\", "/") for n in zf.namelist() if n and not n.endswith("/")
-        ]
-        if not names:
-            raise ValueError("ZIP 文件为空")
-
-        top_dirs = {Path(n).parts[0] for n in names if n.strip()}
-        if len(top_dirs) != 1:
-            raise ValueError("ZIP 必须包含单个顶层文件夹")
-
-        zip_skill_name = next(iter(top_dirs))
-        if zip_skill_name != expected_name:
-            raise ValueError(
-                f"ZIP 内文件夹名 '{zip_skill_name}' 与 Skill 名称 '{expected_name}' 不匹配"
-            )
-
-        import tempfile
-
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            tmp_path = Path(tmp_dir).resolve()
-
-            # Zip Slip protection: validate all member paths before extraction
-            for member in zf.namelist():
-                member_target = (tmp_path / member).resolve()
-                if (
-                    not str(member_target).startswith(str(tmp_path) + os.sep)
-                    and member_target != tmp_path
-                ):
-                    raise ValueError(f"ZIP 包含非法路径: {member}")
-
-            zf.extractall(tmp_dir)
-            src_dir = Path(tmp_dir) / zip_skill_name
-
-            # Best-effort replacement: move current to backup, then replace
-            import uuid as _uuid
-
-            backup_dir = (
-                skill_dir.parent / f".{skill_dir.name}.bak.{_uuid.uuid4().hex[:8]}"
-            )
-            rollback_failed = False
-            try:
-                # Move current to backup (fast rename, unique path avoids
-                # discarding a prior backup from a failed rollback)
-                shutil.move(skill_dir, backup_dir)
-                skill_dir.mkdir()
-
-                # Copy new files
-                for item in src_dir.iterdir():
-                    if item.is_dir():
-                        shutil.copytree(item, skill_dir / item.name)
-                    else:
-                        shutil.copy2(item, skill_dir / item.name)
-
-                # Count actual files (recursive)
-                file_count = sum(1 for f in src_dir.rglob("*") if f.is_file())
-            except Exception:
-                # Rollback: restore from backup
-                try:
-                    if backup_dir.exists():
-                        if skill_dir.exists():
-                            shutil.rmtree(skill_dir)
-                        shutil.move(backup_dir, skill_dir)
-                except Exception as rollback_err:
-                    rollback_failed = True
-                    logger.error(f"Skill 更新回滚失败: {rollback_err}")
-                raise
-            finally:
-                # Clean up backup only if rollback succeeded
-                if not rollback_failed and backup_dir.exists():
-                    try:
-                        shutil.rmtree(backup_dir)
-                    except Exception:
-                        pass
-
-            return file_count
-
-
-def _format_install_result(
-    installed: list[tuple[str, str]], failed: list[tuple[str, str]]
-) -> str:
-    """Format skill installation result."""
-    lines = ["Skill 安装结果:\n"]
-    if installed:
-        lines.append("[成功] 成功:")
-        for n, r in installed:
-            lines.append(f"  • {n}: {r}")
-    if failed:
-        lines.append("\n[失败] 失败:")
-        for n, e in failed:
-            lines.append(f"  • {n}: {e}")
-    lines.append("\n提示: 新 Skills 将在下次对话生效")
-    return "\n".join(lines)
-
-
-def _format_update_result(
-    updated: list[tuple[str, str]], errors: list[tuple[str, str]]
-) -> str:
-    """Format skill update result."""
-    lines = ["Skill 更新结果:\n"]
-    if updated:
-        lines.append("[成功] 更新成功:")
-        for n, info in updated:
-            lines.append(f"  • {n}: {info}")
-    if errors:
-        lines.append("\n[失败] 更新失败:")
-        for n, error in errors:
-            lines.append(f"  • {n}: {error}")
-    lines.append("\n提示: Skill 变更将在下次对话生效")
-    return "\n".join(lines)
