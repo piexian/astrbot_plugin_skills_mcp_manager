@@ -18,8 +18,8 @@ from astrbot.core.astr_agent_context import AstrAgentContext
 from astrbot.core.skills.skill_manager import SkillManager
 from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
 
-from ..services.skill_install import SkillInstallService, failed_result
 from ..services.scan_review import ScanReview
+from ..services.skill_install import SkillInstallService, failed_result
 
 _SKILL_NAME_RE = re.compile(r"^[\w.-]+$")
 
@@ -89,6 +89,7 @@ def _detect_runtime(context: ContextWrapper[AstrAgentContext]) -> str:
         )
         return cfg.get("provider_settings", {}).get("computer_use_runtime", "local")
     except Exception:
+        logger.debug("Could not read runtime configuration; using local", exc_info=True)
         return "local"
 
 
@@ -103,7 +104,7 @@ def _try_sync_to_sandboxes() -> None:
 
         asyncio.ensure_future(sync_skills_to_active_sandboxes())
     except Exception:
-        pass
+        logger.warning("Could not schedule Skill synchronization", exc_info=True)
 
 
 async def _resolve_zip_path(
@@ -233,8 +234,8 @@ class ListSkillsTool(FunctionTool):
                 for s in skills
             ]
             return _ok(data={"skills": result})
-        except Exception as e:
-            logger.error(f"list_skills failed: {e}")
+        except Exception:
+            logger.exception("list_skills failed")
             return _err("列出 Skills 失败，请稍后重试。")
 
 
@@ -276,8 +277,8 @@ class EnableSkillTool(FunctionTool):
             mgr = _get_skill_manager()
             mgr.set_skill_active(skill_name, True)
             return _ok(message=f"已启用 Skill: {skill_name}。{_REFRESH_HINT}")
-        except Exception as e:
-            logger.error(f"enable_skill failed: {e}")
+        except Exception:
+            logger.exception("enable_skill failed")
             return _err("启用 Skill 失败，请检查 Skill 名称是否正确。")
 
 
@@ -321,8 +322,8 @@ class DisableSkillTool(FunctionTool):
             mgr = _get_skill_manager()
             mgr.set_skill_active(skill_name, False)
             return _ok(message=f"已禁用 Skill: {skill_name}。{_REFRESH_HINT}")
-        except Exception as e:
-            logger.error(f"disable_skill failed: {e}")
+        except Exception:
+            logger.exception("disable_skill failed")
             return _err("禁用 Skill 失败，请检查 Skill 名称是否正确。")
 
 
@@ -374,8 +375,8 @@ class DeleteSkillTool(FunctionTool):
             mgr = _get_skill_manager()
             mgr.delete_skill(skill_name)
             return _ok(message=f"已删除 Skill: {skill_name}。{_REFRESH_HINT}")
-        except Exception as e:
-            logger.error(f"delete_skill failed: {e}")
+        except Exception:
+            logger.exception("delete_skill failed")
             return _err("删除 Skill 失败，请检查 Skill 名称是否正确。")
 
 
@@ -444,13 +445,13 @@ class InstallSkillTool(FunctionTool):
             if self.reviewer is not None:
                 result = await self.reviewer.review(result)
             return json.dumps(result, ensure_ascii=False)
-        except SkillZipPathError as e:
-            logger.error(f"install_skill failed: {e}")
+        except SkillZipPathError:
+            logger.exception("install_skill failed")
             return json.dumps(
                 failed_result("无法取得 Skill ZIP 文件。"), ensure_ascii=False
             )
-        except Exception as e:
-            logger.exception(f"install_skill failed: {e}")
+        except Exception:
+            logger.exception("install_skill failed")
             return json.dumps(
                 failed_result("安装准备失败，请查看日志。"), ensure_ascii=False
             )
@@ -543,13 +544,13 @@ class UpdateSkillFromZipTool(FunctionTool):
             if self.reviewer is not None:
                 result = await self.reviewer.review(result)
             return json.dumps(result, ensure_ascii=False)
-        except SkillZipPathError as e:
-            logger.error(f"update_skill_from_zip failed: {e}")
+        except SkillZipPathError:
+            logger.exception("update_skill_from_zip failed")
             return json.dumps(
                 failed_result("无法取得 Skill ZIP 文件。"), ensure_ascii=False
             )
-        except Exception as e:
-            logger.exception(f"update_skill_from_zip failed: {e}")
+        except Exception:
+            logger.exception("update_skill_from_zip failed")
             return json.dumps(
                 failed_result("更新准备失败，请查看日志。"), ensure_ascii=False
             )

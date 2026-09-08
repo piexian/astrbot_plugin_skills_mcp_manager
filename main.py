@@ -8,9 +8,9 @@ from __future__ import annotations
 import json
 import os
 import re
-import time
 import shlex
 import tempfile
+import time
 import zipfile
 from pathlib import Path
 
@@ -23,13 +23,11 @@ from astrbot.core.utils.session_waiter import (
     session_waiter,
 )
 
+from .services.review_language import confirmation_word
 from .services.scan_delivery import ScanDelivery
 from .services.scan_review import ScanReview
-from .services.review_language import confirmation_word
 from .services.skill_install import SkillInstallService, failed_result
 from .services.skill_sources import SkillSources, SourceError
-from .tools.skill_tools import _try_sync_to_sandboxes
-from .tools.utils import mask_sensitive
 from .tools import (
     AddMcpServerTool,
     DeleteSkillTool,
@@ -45,6 +43,8 @@ from .tools import (
     UpdateMcpServerTool,
     UpdateSkillFromZipTool,
 )
+from .tools.skill_tools import _try_sync_to_sandboxes
+from .tools.utils import mask_sensitive
 
 _SKILL_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 _MCP_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -273,8 +273,8 @@ class Main(star.Star):
                     f"[成功] 已启用 Skill: {name}\n提示: 下一次对话生效"
                 )
             )
-        except Exception as e:
-            logger.error(f"skill_on failed for {name}: {e}")
+        except Exception:
+            logger.exception(f"skill_on failed for {name}")
             event.set_result(
                 MessageEventResult().message("[失败] 启用失败，请查看日志")
             )
@@ -297,8 +297,8 @@ class Main(star.Star):
                     f"[成功] 已禁用 Skill: {name}\n提示: 下一次对话生效"
                 )
             )
-        except Exception as e:
-            logger.error(f"skill_off failed for {name}: {e}")
+        except Exception:
+            logger.exception(f"skill_off failed for {name}")
             event.set_result(
                 MessageEventResult().message("[失败] 禁用失败，请查看日志")
             )
@@ -321,8 +321,8 @@ class Main(star.Star):
                     f"[成功] 已删除 Skill: {name}\n提示: 下一次对话生效"
                 )
             )
-        except Exception as e:
-            logger.error(f"skill_del failed for {name}: {e}")
+        except Exception:
+            logger.exception(f"skill_del failed for {name}")
             event.set_result(
                 MessageEventResult().message("[失败] 删除失败，请查看日志")
             )
@@ -411,8 +411,8 @@ class Main(star.Star):
                 .message(f"{file}:\n\n```\n{content}\n```")
                 .use_t2i(False)
             )
-        except Exception as e:
-            logger.error(f"skill_read failed: {e}")
+        except Exception:
+            logger.exception("skill_read failed")
             event.set_result(
                 MessageEventResult().message("[失败] 读取失败，请查看日志")
             )
@@ -785,8 +785,8 @@ class Main(star.Star):
             event.set_result(
                 MessageEventResult().message(f"[失败] 启用 MCP 服务器 {name} 超时")
             )
-        except Exception as e:
-            logger.error(f"mcp_on failed for {name}: {e}")
+        except Exception:
+            logger.exception(f"mcp_on failed for {name}")
             event.set_result(
                 MessageEventResult().message("[失败] 启用失败，请查看日志")
             )
@@ -834,8 +834,8 @@ class Main(star.Star):
             event.set_result(
                 MessageEventResult().message(f"[失败] 禁用 MCP 服务器 {name} 超时")
             )
-        except Exception as e:
-            logger.error(f"mcp_off failed for {name}: {e}")
+        except Exception:
+            logger.exception(f"mcp_off failed for {name}")
             event.set_result(
                 MessageEventResult().message("[失败] 禁用失败，请查看日志")
             )
@@ -875,8 +875,8 @@ class Main(star.Star):
                 return
 
             event.set_result(MessageEventResult().message(f"[成功] 已删除 MCP: {name}"))
-        except Exception as e:
-            logger.error(f"mcp_del failed for {name}: {e}")
+        except Exception:
+            logger.exception(f"mcp_del failed for {name}")
             event.set_result(
                 MessageEventResult().message("[失败] 删除失败，请查看日志")
             )
@@ -1000,8 +1000,8 @@ class Main(star.Star):
             try:
                 await event.send(event.plain_result("正在测试连接..."))
                 await tool_mgr.test_mcp_server_connection(server_config)
-            except Exception as e:
-                logger.error(f"mcp_add connection test failed: {e}")
+            except Exception:
+                logger.exception("mcp_add connection test failed")
                 await event.send(
                     event.plain_result("[失败] 连接测试失败，请检查配置或查看日志")
                 )
@@ -1026,16 +1026,16 @@ class Main(star.Star):
                         "提示: 新工具将在下一次对话生效"
                     )
                 )
-            except Exception as e:
+            except Exception:
                 # Rollback: remove the saved config entry
-                logger.error(f"mcp_add: enable failed for {name}: {e}")
+                logger.exception(f"mcp_add: enable failed for {name}")
                 try:
                     rollback_config = tool_mgr.load_mcp_config()
                     rollback_config.get("mcpServers", {}).pop(name, None)
                     if not tool_mgr.save_mcp_config(rollback_config):
                         logger.error(f"mcp_add: rollback save also failed for {name}")
                 except Exception:
-                    pass
+                    logger.warning("MCP recovery failed", exc_info=True)
                 await event.send(
                     event.plain_result("[失败] 启用失败，已回滚配置，请查看日志")
                 )
@@ -1108,8 +1108,8 @@ class Main(star.Star):
             try:
                 await event.send(event.plain_result("正在测试新配置..."))
                 await tool_mgr.test_mcp_server_connection(new_config)
-            except Exception as e:
-                logger.error(f"mcp_update connection test failed: {e}")
+            except Exception:
+                logger.exception("mcp_update connection test failed")
                 await event.send(
                     event.plain_result("[失败] 连接测试失败，请检查配置或查看日志")
                 )
@@ -1123,7 +1123,7 @@ class Main(star.Star):
                 try:
                     await tool_mgr.disable_mcp_server(name)
                 except Exception:
-                    pass
+                    logger.warning("MCP recovery failed", exc_info=True)
 
             # Save new config
             config["mcpServers"][name] = new_config
@@ -1145,7 +1145,7 @@ class Main(star.Star):
                             name, current_config, timeout=30
                         )
                     except Exception:
-                        pass
+                        logger.warning("MCP recovery failed", exc_info=True)
                 await event.send(event.plain_result("[失败] 保存配置失败，已回滚"))
                 controller.stop()
                 return
@@ -1154,9 +1154,9 @@ class Main(star.Star):
             if new_config.get("active", True):
                 try:
                     await tool_mgr.enable_mcp_server(name, new_config, timeout=30)
-                except Exception as e:
+                except Exception:
                     # Rollback: restore old config and re-enable
-                    logger.error(f"mcp_update: enable failed for {name}: {e}")
+                    logger.exception(f"mcp_update: enable failed for {name}")
                     config["mcpServers"][name] = current_config
                     if not tool_mgr.save_mcp_config(config):
                         logger.error(f"mcp_update: rollback save failed for {name}")
@@ -1173,7 +1173,7 @@ class Main(star.Star):
                                 name, current_config, timeout=30
                             )
                         except Exception:
-                            pass
+                            logger.warning("MCP recovery failed", exc_info=True)
                     await event.send(
                         event.plain_result(
                             "[失败] 启用新配置失败，已回滚旧配置，请查看日志"

@@ -75,8 +75,8 @@ def _rollback_mcp_server(tool_mgr: FunctionToolManager, name: str) -> bool:
             config["mcpServers"].pop(name)
             return tool_mgr.save_mcp_config(config)
         return True
-    except Exception as e:
-        logger.error(f"MCP rollback failed for {name}: {e}")
+    except Exception:
+        logger.exception(f"MCP rollback failed for {name}")
         return False
 
 
@@ -144,8 +144,8 @@ class ListMcpServersTool(FunctionTool):
                 servers.append(server_info)
 
             return _ok(data={"servers": servers})
-        except Exception as e:
-            logger.error(f"list_mcp_servers failed: {e}")
+        except Exception:
+            logger.exception("list_mcp_servers failed")
             return _err("列出 MCP 服务器失败，请稍后重试。")
 
 
@@ -212,8 +212,8 @@ class GetMcpServerConfigTool(FunctionTool):
                 result["tools"] = [t.name for t in rt.client.tools]
 
             return _ok(data=result)
-        except Exception as e:
-            logger.error(f"get_mcp_server_config failed: {e}")
+        except Exception:
+            logger.exception("get_mcp_server_config failed")
             return _err("获取配置失败，请稍后重试。")
 
 
@@ -279,8 +279,8 @@ class EnableMcpServerTool(FunctionTool):
             return _err(
                 f"启用 MCP 服务器 {server_name} 超时。请检查服务器配置和可用性。"
             )
-        except Exception as e:
-            logger.error(f"enable_mcp_server failed: {e}")
+        except Exception:
+            logger.exception("enable_mcp_server failed")
             return _err("启用失败。请检查服务器配置和可用性。")
 
 
@@ -343,8 +343,8 @@ class DisableMcpServerTool(FunctionTool):
             return _ok(message=f"已禁用 MCP 服务器: {server_name}。{_REFRESH_HINT}")
         except TimeoutError:
             return _err(f"禁用 MCP 服务器 {server_name} 超时。")
-        except Exception as e:
-            logger.error(f"disable_mcp_server failed: {e}")
+        except Exception:
+            logger.exception("disable_mcp_server failed")
             return _err("禁用失败。请稍后重试。")
 
 
@@ -411,6 +411,7 @@ class AddMcpServerTool(FunctionTool):
             try:
                 await tool_mgr.test_mcp_server_connection(config)
             except Exception as e:
+                logger.exception("MCP connection test failed")
                 return _err(f"连接测试失败: {e}")
 
             # Save config
@@ -429,12 +430,13 @@ class AddMcpServerTool(FunctionTool):
                 _rollback_mcp_server(tool_mgr, server_name)
                 return _err(f"启用 MCP 服务器 {server_name} 超时，已回滚配置。")
             except Exception as e:
+                logger.exception("MCP activation failed")
                 _rollback_mcp_server(tool_mgr, server_name)
                 return _err(f"启用 MCP 服务器 {server_name} 失败: {e}。已回滚配置。")
 
             return _ok(message=f"MCP 服务器 '{server_name}' 添加成功！{_REFRESH_HINT}")
-        except Exception as e:
-            logger.error(f"add_mcp_server failed: {e}")
+        except Exception:
+            logger.exception("add_mcp_server failed")
             return _err("添加失败。请检查配置格式和服务器可用性。")
 
 
@@ -550,6 +552,7 @@ class UpdateMcpServerTool(FunctionTool):
             try:
                 await tool_mgr.test_mcp_server_connection(config)
             except Exception as e:
+                logger.exception("MCP update connection test failed")
                 return _err(f"新配置连接测试失败: {e}")
 
             # Disable old server if running
@@ -559,7 +562,7 @@ class UpdateMcpServerTool(FunctionTool):
                 try:
                     await tool_mgr.disable_mcp_server(server_name, timeout=10)
                 except Exception:
-                    pass  # Best-effort disable
+                    logger.warning("MCP recovery failed", exc_info=True)
 
             # Save new config
             mcp_config["mcpServers"][server_name] = config
@@ -577,7 +580,7 @@ class UpdateMcpServerTool(FunctionTool):
                             server_name, old_config, timeout=30
                         )
                     except Exception:
-                        pass
+                        logger.warning("MCP recovery failed", exc_info=True)
                 return _err("保存配置失败，已回滚旧配置。")
 
             # Re-enable with new config if should be active
@@ -586,6 +589,9 @@ class UpdateMcpServerTool(FunctionTool):
                     await tool_mgr.enable_mcp_server(server_name, config, timeout=30)
                 except Exception:
                     # Rollback: restore old config and re-enable
+                    logger.exception(
+                        "MCP update activation failed; restoring old configuration"
+                    )
                     mcp_config["mcpServers"][server_name] = old_config
                     if not tool_mgr.save_mcp_config(mcp_config):
                         logger.error(
@@ -600,15 +606,15 @@ class UpdateMcpServerTool(FunctionTool):
                                 server_name, old_config, timeout=30
                             )
                         except Exception:
-                            pass
+                            logger.warning("MCP recovery failed", exc_info=True)
                     return _err("启用新配置失败，已回滚旧配置。请检查配置。")
 
             msg = f"MCP 服务器 '{server_name}' 更新成功！{_REFRESH_HINT}"
             if self.diff_mode and match_info:
                 return _ok(data=match_info, message=msg)
             return _ok(message=msg)
-        except Exception as e:
-            logger.error(f"update_mcp_server failed: {e}")
+        except Exception:
+            logger.exception("update_mcp_server failed")
             return _err("更新失败。请检查配置格式和服务器可用性。")
 
     def _resolve_diff(
@@ -757,6 +763,6 @@ class RemoveMcpServerTool(FunctionTool):
                 return _err("保存配置失败。")
 
             return _ok(message=f"已移除 MCP 服务器: {server_name}。{_REFRESH_HINT}")
-        except Exception as e:
-            logger.error(f"remove_mcp_server failed: {e}")
+        except Exception:
+            logger.exception("remove_mcp_server failed")
             return _err("移除失败。请稍后重试。")

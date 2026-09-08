@@ -25,7 +25,7 @@ MAX_FINDINGS = 100
 MAX_SCAN_SECONDS = 15
 _NAME = re.compile(r"^[\w.-]+$")
 _SECRET = re.compile(
-    r"secret|token|password|credential|api[_-]?key|\.env|\.ssh|\.aws", re.I
+    r"secret|token|password|credential|api[_-]?key|\.env|\.ssh|\.aws", re.IGNORECASE
 )
 _ARCHIVE_SUFFIXES = {".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar", ".whl"}
 _BINARY_SUFFIXES = {".exe", ".dll", ".so", ".dylib", ".pyc", ".pyo", ".wasm", ".bin"}
@@ -55,13 +55,13 @@ class ScanReport:
     def finding(
         self, rule: str, severity: str, path: str, line: int, message: str
     ) -> None:
-        item = dict(
-            rule=rule,
-            severity=severity,
-            file=display_path(path),
-            line=line,
-            message=message,
-        )
+        item = {
+            "rule": rule,
+            "severity": severity,
+            "file": display_path(path),
+            "line": line,
+            "message": message,
+        }
         if item in self.findings:
             return
         if len(self.findings) >= MAX_FINDINGS:
@@ -73,7 +73,7 @@ class ScanReport:
         self.decision = "block"
         if len(self.limitations) < MAX_FINDINGS:
             self.limitations.append(
-                dict(code=code, message=message, file=display_path(path))
+                {"code": code, "message": message, "file": display_path(path)}
             )
 
     def finish(self) -> None:
@@ -256,7 +256,7 @@ _TEXT_RULES = [
         "high",
         re.compile(
             r"(?:ignore|bypass|disregard)\s+(?:all\s+)?(?:safety|security)\s+(?:rules?|checks?|constraints?)|(?:忽略|绕过|无视)(?:所有)?(?:安全规则|安全检查|安全限制)",
-            re.I,
+            re.IGNORECASE,
         ),
         "指令要求绕过安全约束。",
     ),
@@ -265,7 +265,7 @@ _TEXT_RULES = [
         "high",
         re.compile(
             r"(?:silently|secretly|covertly)\s+(?:send|upload|transmit)\b.{0,100}(?:token|secret|credential|conversation|chat)|(?:偷偷|秘密|悄悄).{0,30}(?:上传|发送|外传).{0,50}(?:密钥|令牌|凭据|聊天|会话)",
-            re.I,
+            re.IGNORECASE,
         ),
         "指令要求秘密外传敏感信息。",
     ),
@@ -273,7 +273,8 @@ _TEXT_RULES = [
         "download_execute",
         "high",
         re.compile(
-            r"\b(?:curl|wget)\b[^\n|]{0,500}\|\s*(?:sudo\s+)?(?:sh|bash|zsh)\b", re.I
+            r"\b(?:curl|wget)\b[^\n|]{0,500}\|\s*(?:sudo\s+)?(?:sh|bash|zsh)\b",
+            re.IGNORECASE,
         ),
         "下载内容直接通过管道交给 shell 执行。",
     ),
@@ -288,7 +289,7 @@ _TEXT_RULES = [
         "high",
         re.compile(
             r"\bcurl\b.{0,200}(?:--data(?:-binary|-raw)?|-d|-F|--upload-file|-T)\s*[^\n]{0,100}@?(?:~/|\$HOME/)?(?:\.env\b|\.ssh/|\.aws/)",
-            re.I,
+            re.IGNORECASE,
         ),
         "网络命令将敏感文件用作上传内容。",
     ),
@@ -297,14 +298,14 @@ _TEXT_RULES = [
         "warning",
         re.compile(
             r"ignore\s+(?:all\s+)?previous\s+instructions?|忽略(?:所有)?(?:之前|以前)的?指令",
-            re.I,
+            re.IGNORECASE,
         ),
         "出现覆盖先前指令的表述，需要核对上下文。",
     ),
 ]
 _NEGATED = re.compile(
     r"(?:\b(?:do not|don't|never|avoid|must not)\s+(?:(?:run|execute)\s+)?|(?:不要|禁止|切勿|不得)(?:运行|执行)?)$",
-    re.I,
+    re.IGNORECASE,
 )
 
 
@@ -375,25 +376,26 @@ class _PythonScan(ast.NodeVisitor):
         tags: set[str] = set()
         if isinstance(node, ast.Call):
             name = self.name(node.func)
-            if name in {"os.getenv", "os.environ.get", "open", "pathlib.Path"}:
-                if any(
-                    isinstance(a, ast.Constant)
-                    and isinstance(a.value, str)
-                    and _SECRET.search(a.value)
-                    for a in node.args[:1]
-                ):
-                    tags.add("secret")
+            if name in {"os.getenv", "os.environ.get", "open", "pathlib.Path"} and any(
+                isinstance(a, ast.Constant)
+                and isinstance(a.value, str)
+                and _SECRET.search(a.value)
+                for a in node.args[:1]
+            ):
+                tags.add("secret")
             if name.startswith(
                 ("requests.", "httpx.", "urllib.request.")
             ) and name.rsplit(".", 1)[-1] in {"get", "post", "urlopen", "request"}:
                 tags.add("remote")
             if name in {"base64.b64decode", "base64.decodebytes", "bytes.fromhex"}:
                 tags.add("encoded")
-        if isinstance(node, ast.Subscript) and self.name(node.value) == "os.environ":
-            if isinstance(node.slice, ast.Constant) and _SECRET.search(
-                str(node.slice.value)
-            ):
-                tags.add("secret")
+        if (
+            isinstance(node, ast.Subscript)
+            and self.name(node.value) == "os.environ"
+            and isinstance(node.slice, ast.Constant)
+            and _SECRET.search(str(node.slice.value))
+        ):
+            tags.add("secret")
         for child in ast.iter_child_nodes(node):
             tags |= self.source(child)
         return tags
@@ -511,13 +513,12 @@ def _valid_png(content: bytes) -> bool:
             return False
         if chunks == 0 and (kind != b"IHDR" or size != 13):
             return False
-        if kind == b"IHDR":
-            if (
-                chunks
-                or not int.from_bytes(payload[:4], "big")
-                or not int.from_bytes(payload[4:8], "big")
-            ):
-                return False
+        if kind == b"IHDR" and (
+            chunks
+            or not int.from_bytes(payload[:4], "big")
+            or not int.from_bytes(payload[4:8], "big")
+        ):
+            return False
         if kind == b"IDAT":
             has_data = True
         if kind == b"IEND":

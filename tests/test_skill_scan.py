@@ -301,11 +301,15 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_install_failure_preserves_scan_report(self):
         path = self.archive({"demo/SKILL.md": "Normal"})
-        with patch.object(
-            self.manager, "install_skill_from_zip", side_effect=OSError("disk failed")
+        with (
+            patch.object(
+                self.manager,
+                "install_skill_from_zip",
+                side_effect=OSError("disk failed"),
+            ),
+            self.assertLogs(service.logger, level="ERROR"),
         ):
-            with self.assertLogs(service.logger, level="ERROR"):
-                result = await self.installer.run(self.manager, path)
+            result = await self.installer.run(self.manager, path)
         self.assertFalse(result["ok"])
         self.assertEqual(result["operation_status"], "failed")
         self.assertEqual(result["scan"]["status"], "complete")

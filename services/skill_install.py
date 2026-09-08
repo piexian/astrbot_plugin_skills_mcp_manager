@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import logging
 import os
@@ -8,14 +9,13 @@ import re
 import shutil
 import tempfile
 import zipfile
-import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from ..security.scanner import (
-    MAX_FILE_BYTES,
     MAX_ENTRIES,
+    MAX_FILE_BYTES,
     MAX_TOTAL_BYTES,
     InspectionError,
     ScanReport,

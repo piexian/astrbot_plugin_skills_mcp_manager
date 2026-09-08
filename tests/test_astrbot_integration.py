@@ -3,14 +3,13 @@
 SKILL_SCAN_ASTRBOT_TESTS=1 python -m unittest tests.test_astrbot_integration -v
 """
 
-import importlib
 import asyncio
+import importlib
+import importlib.util
 import json
 import os
-import subprocess
 import sys
 import tempfile
-import types
 import unittest
 import zipfile
 from pathlib import Path
@@ -129,7 +128,7 @@ class AstrBotIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.plugin.scan_delivery.deliver = AsyncMock()
         with patch.object(self.main, "SkillManager", return_value=self.manager):
-            result, candidate = await self.plugin._prepare_skill_upload(
+            result, _candidate = await self.plugin._prepare_skill_upload(
                 event, attachment
             )
         self.assertEqual(result["scan"]["decision"], "block")
@@ -144,7 +143,7 @@ class AstrBotIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.plugin.scan_delivery.deliver = AsyncMock()
         with self.assertLogs("astrbot", level="ERROR"):
-            result, candidate = await self.plugin._prepare_skill_upload(
+            result, _candidate = await self.plugin._prepare_skill_upload(
                 event, attachment
             )
         self.assertEqual(result["scan"]["status"], "incomplete")
@@ -183,7 +182,7 @@ class AstrBotIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         plugin.scan_delivery.deliver = AsyncMock()
         with patch.object(self.main, "SkillManager", return_value=self.manager):
-            result, candidate = await plugin._prepare_skill_upload(event, attachment)
+            result, _candidate = await plugin._prepare_skill_upload(event, attachment)
         self.assertEqual(result["model_review"]["status"], "completed")
         plugin.scan_delivery.deliver.assert_not_awaited()
         self.assertEqual(event.sent[-1], "高风险，保持阻断。")
@@ -334,7 +333,7 @@ class AstrBotIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def _exercise_confirmation(self, scenario, language="简体中文", link=False):
         import astrbot.api.message_components as Comp
-        from astrbot.core.utils.session_waiter import SessionWaiter, USER_SESSIONS
+        from astrbot.core.utils.session_waiter import USER_SESSIONS, SessionWaiter
 
         class CommandEvent(Event):
             role = "admin"
@@ -476,25 +475,27 @@ class AstrBotIntegrationTests(unittest.IsolatedAsyncioTestCase):
         import astrbot
 
         source_root = Path(astrbot.__file__).resolve().parent.parent
-        source = subprocess.run(
-            [
-                "git",
-                "-C",
-                str(source_root),
-                "show",
-                "v4.23.6:astrbot/core/skills/skill_manager.py",
-            ],
-            capture_output=True,
-            text=True,
+        process = await asyncio.create_subprocess_exec(
+            "git",
+            "-C",
+            str(source_root),
+            "show",
+            "v4.23.6:astrbot/core/skills/skill_manager.py",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
-        if source.returncode:
+        source, _ = await process.communicate()
+        if process.returncode:
             self.skipTest("local AstrBot v4.23.6 tag unavailable")
-        legacy = types.ModuleType("legacy_skill_manager_test")
+        legacy_path = self.root / "legacy_skill_manager_test.py"
+        legacy_path.write_bytes(source)
+        spec = importlib.util.spec_from_file_location(
+            "legacy_skill_manager_test", legacy_path
+        )
+        legacy = importlib.util.module_from_spec(spec)
         sys.modules[legacy.__name__] = legacy
         self.addCleanup(sys.modules.pop, legacy.__name__, None)
-        exec(
-            compile(source.stdout, "v4.23.6/skill_manager.py", "exec"), legacy.__dict__
-        )
+        spec.loader.exec_module(legacy)
         manager = legacy.SkillManager(skills_root=str(self.root / "legacy-skills"))
         result = await self.plugin.skill_installer.run(manager, self.archive())
         self.assertTrue(result["ok"], result)

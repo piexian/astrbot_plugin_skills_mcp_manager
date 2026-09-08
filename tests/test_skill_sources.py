@@ -1,5 +1,5 @@
-import base64
 import asyncio
+import base64
 import hashlib
 import importlib
 import io
@@ -8,6 +8,7 @@ import unittest
 import zipfile
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+from urllib.parse import urlsplit
 
 from .support import PACKAGE
 
@@ -142,7 +143,10 @@ class SourceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("scripts/run.py", bundle.files)
         self.assertFalse(
-            any("raw.githubusercontent.com" in call for call in client.calls)
+            any(
+                urlsplit(call).hostname == "raw.githubusercontent.com"
+                for call in client.calls
+            )
         )
         self.assertNotIn("secret", json.dumps(bundle.provenance))
 
@@ -161,7 +165,11 @@ class SourceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_changed_blob_and_truncated_tree_are_rejected(self):
         client, _ = self.fixture()
-        raw = next(url for url in client.routes if "raw.githubusercontent.com" in url)
+        raw = next(
+            url
+            for url in client.routes
+            if urlsplit(url).hostname == "raw.githubusercontent.com"
+        )
         client.routes[raw] = b"changed"
         with self.assertRaisesRegex(sources.SourceError, "指纹不一致"):
             await sources.SkillSources()._resolve(

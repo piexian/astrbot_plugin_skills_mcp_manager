@@ -1,0 +1,4 @@
+target-version = "py310"
+
+[lint]
+logger-objects = ["astrbot.api.logger"]

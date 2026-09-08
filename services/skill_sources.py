@@ -175,9 +175,9 @@ class SourceBundle:
 def _name(content: bytes, fallback: str) -> str:
     # Read only a scalar name, not arbitrary YAML from an untrusted manifest.
     text = content[:65536].decode("utf-8-sig", errors="replace")
-    frontmatter = re.match(r"\A---\s*\n(.*?)\n---(?:\s|$)", text, re.S)
+    frontmatter = re.match(r"\A---\s*\n(.*?)\n---(?:\s|$)", text, re.DOTALL)
     if frontmatter:
-        match = re.search(r"^name:\s*([^\r\n]+)", frontmatter[1], re.M)
+        match = re.search(r"^name:\s*([^\r\n]+)", frontmatter[1], re.MULTILINE)
         if match:
             name = match[1].strip().strip("\"'")
             if valid_skill_name(name):
