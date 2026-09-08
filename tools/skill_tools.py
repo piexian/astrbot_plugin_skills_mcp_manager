@@ -394,6 +394,7 @@ class InstallSkillTool(FunctionTool):
         "ZIP 可包含单个顶层文件夹或在根目录直接包含 SKILL.md。"
         "路径可以是本地绝对路径或沙盒路径（自动下载）。"
         "安装前进行静态扫描，所有结果均包含 scan 报告；阻断时不会安装。"
+        "请按返回的 review_language 向用户说明审查结果。"
     )
     installer: SkillInstallService = field(default_factory=SkillInstallService)
     reviewer: ScanReview | None = None
@@ -474,6 +475,7 @@ class UpdateSkillFromZipTool(FunctionTool):
     description: str = (
         "从 ZIP 文件更新已存在的 Skill。需要管理员权限。会覆盖 Skill 的所有文件。"
         "更新前进行静态扫描，所有结果均包含 scan 报告；阻断时保留旧版本。"
+        "请按返回的 review_language 向用户说明审查结果。"
     )
     installer: SkillInstallService = field(default_factory=SkillInstallService)
     reviewer: ScanReview | None = None

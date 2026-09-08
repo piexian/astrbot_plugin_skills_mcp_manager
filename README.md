@@ -14,7 +14,7 @@
 ## 功能
 
 - 13 个 LLM Tool，覆盖 Skills 和 MCP 全生命周期管理
-- 支持国际化（中文 / English），Dashboard 根据当前语言自动切换
+- 支持国际化（中文 / English / 日本語），Dashboard 根据当前语言自动切换
 - `/skill` 命令组，用户可直接通过指令管理 Skills
 - `/mcp` 命令组，用户可直接通过指令管理 MCP 服务器
 - 内置英文版 `skills-mcp-manager` Skill，引导 AI 正确调用管理工具
@@ -71,8 +71,8 @@ https://github.com/piexian/astrbot_plugin_skills_mcp_manager
 /skill del <名称>      # 删除 Skill
 /skill files <名称>    # 查看文件结构
 /skill read <名称> <文件>  # 读取文件内容
-/skill install [--force]       # 上传 ZIP，报告返回后发送“确认”安装
-/skill update <名称> [--force] # 上传 ZIP 或单文件，报告返回后发送“确认”更新
+/skill install [--force]       # 上传 ZIP，报告返回后发送提示的确认词安装
+/skill update <名称> [--force] # 上传 ZIP 或单文件，报告返回后发送提示的确认词更新
 
 /mcp ls                # 列出所有 MCP 服务器
 /mcp config <名称>     # 查看配置详情
@@ -89,9 +89,10 @@ https://github.com/piexian/astrbot_plugin_skills_mcp_manager
 ZIP 在正式写入前检查整个包；单文件更新在临时候选内容中合并更新，再检查整个 Skill。
 静态扫描不会执行 Skill 脚本、调用模型或联网获取依赖。报告由选定的审查模型或当前会话主模型解释。
 
-- 命令入口先返回报告，不写入正式目录。默认等待 300 秒，可通过 `skill_confirm_timeout` 调整；只有同一会话发起者发送纯文本 `确认` 才执行。空格、换行、标点、同义回复或附带附件都不算确认，也不延长等待。超时不安装。
+- 命令入口先返回报告，不写入正式目录。默认等待 300 秒，可通过 `skill_confirm_timeout` 调整；只有同一会话发起者发送当前语言对应的纯文本确认词才执行。空格、换行、标点、大小写变体、同义回复或附带附件都不算确认，也不延长等待。超时不安装。
 - 命令默认拒绝高风险和不完整扫描；显式传入 `--force` 可忽略内容分析结果，但仍展示报告并等待确认。不安全路径、包结构和输入大小上限不能绕过。同一条消息可上传多个文件，报告后确认待安装列表；等待期间不能再追加文件。
 - `skill_review_provider_id` 留空时使用当前会话主模型；指定后，命令直接返回该模型的文本报告，不调用主模型，不安排主模型补投。指定模型失败时直接展示静态报告。审查模型只读取报告，不读取 Skill 全文。
+- `skill_review_language` 可选 `简体中文`、`English`、`日本語`，默认简体中文，用于模型审查报告。确认词分别固定为 `确认`、`confirm`、`確認`，每种语言只接受一个词，必须精确匹配。
 - AI 工具沿用原有确认方式，审阅意见和扫描报告仍返回主模型。`skill_scan_mode=enforce` 拦截高风险；`report_only` 允许完整扫描后的风险内容通过，两者均拒绝不完整扫描。不提供工具参数跳过扫描。
 - 启用、其他渠道安装、原生文件工具编辑和全局巡检不在拦截范围内。
 - 安装不覆盖同名 Skill，请使用更新入口；更新保留原有启用状态。被阻断的更新不会修改旧文件。

@@ -1,0 +1,33 @@
+{
+  "metadata": {
+    "display_name": "Skills & MCP マネージャー",
+    "short_desc": "AstrBot の Skills と MCP サーバーを管理するツール",
+    "desc": "関数ツールとコマンドで AstrBot の Skills と MCP サーバーを管理します。Skill のライフサイクル管理、MCP サーバー設定、組み込みの管理用 Skill に対応しています。"
+  },
+  "config": {
+    "skill_review_language": {
+      "description": "審査レポートの言語",
+      "hint": "レポートの言語と対応する確認キーワードを選択します。"
+    },
+    "skill_confirm_timeout": {
+      "description": "Skill コマンドの確認待ち時間（秒）",
+      "hint": "レポートの返信後に確認キーワードを待つ秒数。時間切れでインストールを中止します。"
+    },
+    "skill_review_provider_id": {
+      "description": "Skill 審査モデル（任意）",
+      "hint": "空欄なら会話モデルを使用。指定時はコマンドがそのモデルのレポートを直接返します。"
+    },
+    "skill_scan_mode": {
+      "description": "Skill 静的スキャンの方針",
+      "hint": "AI ツール用：enforce はリスクを検出するとブロック、report_only は報告のみ。"
+    },
+    "diff_mode": {
+      "description": "編集モード",
+      "hint": "MCP 設定を差分置換で編集し、全体の上書きを防ぎます。"
+    },
+    "diff_match_threshold": {
+      "description": "テキスト一致率",
+      "hint": "差分置換に必要な一致率。100 は完全一致です。"
+    }
+  }
+}

@@ -7,6 +7,8 @@ import json
 import logging
 from typing import Any
 
+from .review_language import language_instruction, normalize_language
+
 logger = logging.getLogger(__name__)
 _INSTRUCTIONS = (
     "审阅下面的 Skill 静态扫描报告，简要说明风险、扫描局限和实际操作结果。"
@@ -19,11 +21,13 @@ _INSTRUCTIONS = (
 
 
 class ScanReview:
-    def __init__(self, context: Any, provider_id: str = ""):
+    def __init__(self, context: Any, provider_id: str = "", language: str = "简体中文"):
         self.context = context
         self.provider_id = provider_id.strip()
+        self.language = normalize_language(language)
 
     async def review(self, result: dict) -> dict:
+        result = {**result, "review_language": self.language}
         # With no override, the ordinary tool response/command delivery already
         # gives the report to the session model. Avoid a duplicate model request.
         if not self.provider_id:
@@ -34,7 +38,9 @@ class ScanReview:
                 self.context.llm_generate(
                     chat_provider_id=self.provider_id,
                     prompt=json.dumps(result, ensure_ascii=True, separators=(",", ":")),
-                    system_prompt=_INSTRUCTIONS,
+                    system_prompt=_INSTRUCTIONS
+                    + "\n"
+                    + language_instruction(self.language),
                 ),
                 timeout=30,
             )

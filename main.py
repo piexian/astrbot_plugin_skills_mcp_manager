@@ -22,6 +22,7 @@ from astrbot.core.utils.session_waiter import (
 
 from .services.scan_delivery import ScanDelivery
 from .services.scan_review import ScanReview
+from .services.review_language import confirmation_word
 from .services.skill_install import SkillInstallService, failed_result
 from .tools.skill_tools import _try_sync_to_sandboxes
 from .tools.utils import mask_sensitive
@@ -62,9 +63,10 @@ class Main(star.Star):
         self.skill_installer = SkillInstallService(
             config.get("skill_scan_mode", "enforce")
         )
-        self.scan_delivery = ScanDelivery(self)
+        review_language = config.get("skill_review_language", "简体中文")
+        self.scan_delivery = ScanDelivery(self, language=review_language)
         self.scan_review = ScanReview(
-            context, config.get("skill_review_provider_id", "")
+            context, config.get("skill_review_provider_id", ""), language=review_language
         )
         self.skill_confirm_timeout = max(
             1, int(config.get("skill_confirm_timeout", 300))
@@ -398,6 +400,7 @@ class Main(star.Star):
         confirmation_event = origin
         sender = origin.get_sender_id()
         umo = origin.unified_msg_origin
+        confirm_word = confirmation_word(self.scan_review.language)
 
         def discard():
             for candidate in pending:
@@ -423,13 +426,13 @@ class Main(star.Star):
                 # Do not trim, infer intent, accept synonyms, or extend the deadline.
                 messages = event.get_messages()
                 if (
-                    event.message_str != "确认"
+                    event.message_str != confirm_word
                     or any(not isinstance(msg, Comp.Plain) for msg in messages)
-                    or "".join(msg.text for msg in messages) != "确认"
+                    or "".join(msg.text for msg in messages) != confirm_word
                 ):
                     await event.send(
                         event.plain_result(
-                            "尚未安装。仅接受纯文本“确认”，其他回复不会延长确认期限。"
+                            f"尚未安装。仅接受纯文本“{confirm_word}”，其他回复不会延长确认期限。"
                         )
                     )
                     return
@@ -488,7 +491,7 @@ class Main(star.Star):
                     "尚未安装/更新。待确认内容："
                     + "；".join(names)
                     + ("\n强制模式：将忽略内容分析结果，但仍需确认。" if force else "")
-                    + f"\n请在 {self.skill_confirm_timeout} 秒内仅发送“确认”两字；超时不安装。"
+                    + f"\n请在 {self.skill_confirm_timeout} 秒内仅发送“{confirm_word}”；超时不安装。"
                 )
             )
             if controller.future.done():
@@ -506,7 +509,7 @@ class Main(star.Star):
                         if skill_name
                         else "Skill 安装模式"
                     )
-                    + "\n请在 120 秒内上传文件。将先返回报告，再等待“确认”。"
+                    + f"\n请在 120 秒内上传文件。将先返回报告，再等待“{confirm_word}”。"
                     + (
                         "\n已启用 --force，内容分析不阻断安装；路径和包结构检查仍执行。"
                         if force

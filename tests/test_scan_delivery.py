@@ -120,6 +120,26 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request.prompt, "hello")
         self.assertTrue(self.owner.store)
 
+    async def test_language_applies_to_main_model_and_pending_report(self):
+        for language, instruction in (
+            ("简体中文", "请使用简体中文"),
+            ("English", "Write the review report in English."),
+            ("日本語", "審査レポートは日本語"),
+        ):
+            with self.subTest(language=language):
+                delivery = delivery_module.ScanDelivery(self.owner, language=language)
+                await delivery.deliver(self.event, self.result)
+                call = self.owner.context.llm_generate.call_args.kwargs
+                self.assertIn(instruction, call["system_prompt"])
+                self.assertIn(instruction, call["prompt"])
+                item, _ = await delivery._enqueue(
+                    self.event.unified_msg_origin, self.result
+                )
+                request = SimpleNamespace(prompt="hello")
+                await delivery.inject_pending(self.event, request)
+                self.assertIn(instruction, request.prompt)
+                await delivery._ack(self.event.unified_msg_origin, {item["id"]})
+
     async def test_external_review_still_goes_to_current_session_model(self):
         self.result["model_review"] = {
             "provider_id": "separate-reviewer",

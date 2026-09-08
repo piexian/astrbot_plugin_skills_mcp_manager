@@ -5,9 +5,13 @@
     "desc": "为 AstrBot 提供函数工具和指令来管理 AstrBot Skills 和 MCP 服务器，支持 Skills 生命周期管理、MCP 服务器配置管理，以及内置管理 Skill。"
   },
   "config": {
+    "skill_review_language": {
+      "description": "审查回复语言",
+      "hint": "选择报告语言及对应的确认词。"
+    },
     "skill_confirm_timeout": {
       "description": "Skill 命令确认等待时间（秒）",
-      "hint": "报告返回后等待“确认”的秒数，超时不安装。"
+      "hint": "报告返回后等待确认词的秒数，超时不安装。"
     },
     "skill_review_provider_id": {
       "description": "Skill 审查模型（可选）",

@@ -223,7 +223,19 @@ class AstrBotIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_command_blocked_scan_cannot_be_confirmed(self):
         await self._exercise_confirmation("blocked")
 
-    async def _exercise_confirmation(self, scenario):
+    async def test_english_accepts_only_lowercase_confirm(self):
+        await self._exercise_confirmation("exact", language="English")
+
+    async def test_japanese_accepts_only_japanese_confirmation(self):
+        await self._exercise_confirmation("exact", language="日本語")
+
+    async def test_japanese_force_requires_japanese_confirmation(self):
+        await self._exercise_confirmation("force", language="日本語")
+
+    async def test_english_wrong_word_does_not_extend_timeout(self):
+        await self._exercise_confirmation("timeout", language="English")
+
+    async def _exercise_confirmation(self, scenario, language="简体中文"):
         import astrbot.api.message_components as Comp
         from astrbot.core.utils.session_waiter import SessionWaiter, USER_SESSIONS
 
@@ -260,7 +272,16 @@ class AstrBotIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 )
             ),
         )
-        plugin = self.main.Main(context, {"skill_review_provider_id": "review-model"})
+        plugin = self.main.Main(
+            context,
+            {
+                "skill_review_provider_id": "review-model",
+                "skill_review_language": language,
+            },
+        )
+        word = {"简体中文": "确认", "English": "confirm", "日本語": "確認"}[language]
+        self.assertEqual(plugin.scan_review.language, language)
+        self.assertEqual(plugin.scan_delivery.language, language)
         plugin.skill_confirm_timeout = 0.1 if scenario == "timeout" else 3
         plugin.scan_delivery.deliver = AsyncMock()
         origin = CommandEvent("/skill install")
@@ -285,6 +306,8 @@ class AstrBotIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 await until(lambda: key in USER_SESSIONS)
                 await SessionWaiter.trigger(key, upload)
                 self.assertFalse(Path(self.manager.skills_root, "demo").exists())
+                if scenario != "blocked":
+                    self.assertIn(f"“{word}”", upload.sent[-1])
                 if scenario == "blocked":
                     await asyncio.wait_for(task, 3)
                 elif scenario == "timeout":
@@ -295,19 +318,31 @@ class AstrBotIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     await asyncio.wait_for(task, 3)
                     self.assertIn("超时", origin.sent[-1])
                 else:
-                    for text in ("确认安装", "好的", "确认！", " 确认", "确认\n"):
+                    invalid_words = {
+                        "确认安装",
+                        "好的",
+                        "yes",
+                        "はい",
+                        "Confirm",
+                        "CONFIRM",
+                        "确认",
+                        "確認",
+                        "confirm",
+                        f" {word}",
+                        f"{word}\n",
+                        f"{word}！",
+                    } - {word}
+                    for text in invalid_words:
                         await SessionWaiter.trigger(key, CommandEvent(text))
                         self.assertFalse(task.done())
-                    other = CommandEvent("确认", sender="bob")
+                    other = CommandEvent(word, sender="bob")
                     self.assertNotEqual(session_filter.filter(other), key)
                     await SessionWaiter.trigger(key, other)
                     self.assertFalse(task.done())
-                    mixed = CommandEvent(
-                        "确认", messages=[Comp.Plain("确认"), attachment]
-                    )
+                    mixed = CommandEvent(word, messages=[Comp.Plain(word), attachment])
                     await SessionWaiter.trigger(key, mixed)
                     self.assertFalse(task.done())
-                    await SessionWaiter.trigger(key, CommandEvent("确认"))
+                    await SessionWaiter.trigger(key, CommandEvent(word))
                     await asyncio.wait_for(task, 3)
                     self.assertTrue(
                         Path(self.manager.skills_root, "demo", "SKILL.md").exists()

@@ -5,9 +5,13 @@
     "desc": "Provides function tools and commands for managing AstrBot Skills and MCP servers, including skill lifecycle management, MCP server configuration management, and a built-in management skill."
   },
   "config": {
+    "skill_review_language": {
+      "description": "Review Reply Language",
+      "hint": "Choose the report language and its confirmation word."
+    },
     "skill_confirm_timeout": {
       "description": "Skill Command Confirmation Timeout (Seconds)",
-      "hint": "Wait for the exact reply 确认 after the report; timeout cancels installation."
+      "hint": "Seconds to wait for the confirmation word; timeout cancels installation."
     },
     "skill_review_provider_id": {
       "description": "Skill Review Model (Optional)",

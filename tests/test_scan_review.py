@@ -25,7 +25,8 @@ class ReviewTests(unittest.IsolatedAsyncioTestCase):
             result = await module.ScanReview(self.context, selection).review(
                 self.result
             )
-            self.assertIs(result, self.result)
+            self.assertEqual(result["scan"], self.result["scan"])
+            self.assertEqual(result["review_language"], "简体中文")
         self.context.llm_generate.assert_not_awaited()
 
     async def test_selected_model_receives_report_only_and_preserves_decisions(self):
@@ -40,6 +41,33 @@ class ReviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["operation_status"], "not_performed")
         self.assertEqual(result["model_review"]["status"], "completed")
         self.assertNotIn("model_review", self.result)
+
+    async def test_reply_language_reaches_reviewer_and_tool_result(self):
+        for language, instruction in (
+            ("简体中文", "请使用简体中文"),
+            ("English", "Write the review report in English."),
+            ("日本語", "審査レポートは日本語"),
+        ):
+            with self.subTest(language=language):
+                result = await module.ScanReview(
+                    self.context, "reviewer", language=language
+                ).review(self.result)
+                self.assertEqual(result["review_language"], language)
+                self.assertIn(
+                    instruction,
+                    self.context.llm_generate.call_args.kwargs["system_prompt"],
+                )
+                self.assertEqual(result["scan"], self.result["scan"])
+                result = await module.ScanReview(
+                    self.context, language=language
+                ).review(self.result)
+                self.assertEqual(result["review_language"], language)
+
+    async def test_unknown_language_falls_back_to_simplified_chinese(self):
+        result = await module.ScanReview(self.context, language="unknown").review(
+            self.result
+        )
+        self.assertEqual(result["review_language"], "简体中文")
 
     async def test_failed_empty_or_error_model_returns_original_report_with_failure(
         self,
