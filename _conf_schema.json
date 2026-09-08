@@ -1,4 +1,18 @@
 {
+  "skill_github_token": {
+    "description": "GitHub Token（可选）",
+    "type": "string",
+    "default": "",
+    "secret": true,
+    "hint": "用于私有仓库安装或提高 API 限额。"
+  },
+  "skillhub_api_key": {
+    "description": "SkillHub API Key（可选）",
+    "type": "string",
+    "default": "",
+    "secret": true,
+    "hint": "腾讯 SkillHub 的接口访问凭证。"
+  },
   "skill_review_language": {
     "description": "审查回复语言",
     "type": "string",

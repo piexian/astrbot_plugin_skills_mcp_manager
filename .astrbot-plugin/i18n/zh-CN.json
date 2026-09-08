@@ -5,6 +5,14 @@
     "desc": "为 AstrBot 提供函数工具和指令来管理 AstrBot Skills 和 MCP 服务器，支持 Skills 生命周期管理、MCP 服务器配置管理，以及内置管理 Skill。"
   },
   "config": {
+    "skill_github_token": {
+      "description": "GitHub Token（可选）",
+      "hint": "用于私有仓库安装或提高 API 限额。"
+    },
+    "skillhub_api_key": {
+      "description": "SkillHub API Key（可选）",
+      "hint": "腾讯 SkillHub 的接口访问凭证。"
+    },
     "skill_review_language": {
       "description": "审查回复语言",
       "hint": "选择报告语言及对应的确认词。"

@@ -5,6 +5,14 @@
     "desc": "Provides function tools and commands for managing AstrBot Skills and MCP servers, including skill lifecycle management, MCP server configuration management, and a built-in management skill."
   },
   "config": {
+    "skill_github_token": {
+      "description": "GitHub Token (Optional)",
+      "hint": "Install from private repositories or increase API rate limits."
+    },
+    "skillhub_api_key": {
+      "description": "SkillHub API Key (Optional)",
+      "hint": "API credential for Tencent SkillHub."
+    },
     "skill_review_language": {
       "description": "Review Reply Language",
       "hint": "Choose the report language and its confirmation word."

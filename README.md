@@ -19,6 +19,7 @@
 - `/mcp` 命令组，用户可直接通过指令管理 MCP 服务器
 - 内置英文版 `skills-mcp-manager` Skill，引导 AI 正确调用管理工具
 - 本插件安装、更新 Skill 前执行离线静态扫描，支持可选审查模型和命令二次确认
+- 支持通过 GitHub、skills.sh、ClawHub、腾讯 SkillHub、SkillsMP 链接下载 Skill
 
 ## 安装
 
@@ -71,8 +72,8 @@ https://github.com/piexian/astrbot_plugin_skills_mcp_manager
 /skill del <名称>      # 删除 Skill
 /skill files <名称>    # 查看文件结构
 /skill read <名称> <文件>  # 读取文件内容
-/skill install [--force]       # 上传 ZIP，报告返回后发送提示的确认词安装
-/skill update <名称> [--force] # 上传 ZIP 或单文件，报告返回后发送提示的确认词更新
+/skill install [链接] [技能名] [--force]       # 链接安装或进入上传模式
+/skill update <名称> [链接] [技能名] [--force] # 链接更新或进入上传模式
 
 /mcp ls                # 列出所有 MCP 服务器
 /mcp config <名称>     # 查看配置详情
@@ -85,9 +86,32 @@ https://github.com/piexian/astrbot_plugin_skills_mcp_manager
 
 ### Skill 安装与更新扫描
 
+可直接发送命令，不需要 AI 调用工具下载安装：
+
+```text
+/skill install https://github.com/anthropics/skills/tree/main/skills/frontend-design
+/skill install https://skills.sh/vercel-labs/agent-skills/vercel-composition-patterns
+/skill install https://github.com/anthropics/skills frontend-design
+/skill update frontend-design https://github.com/anthropics/skills/tree/main/skills/frontend-design
+```
+
+省略链接进入交互模式后，也可以发送 `链接 [技能名]` 或上传 ZIP。仓库中有多个 Skill 时必须指定唯一技能名或目录；`--force` 仍只在发起命令时指定，确认阶段不接受更改参数。
+
+| 来源 | 支持的链接与处理方式 |
+|------|--------------------|
+| GitHub | 仓库、`tree` 目录、`blob`/raw `SKILL.md`，以及归档/Release 下载链接。仓库内容固定提交，下载完整 Skill 目录并核对 Git blob 指纹 |
+| skills.sh | `/owner/repo/skill`，按清单名称定位真实目录，复用 GitHub 下载 |
+| ClawHub | `/owner/skills/slug` 或 `/owner/slug`，下载固定版本 ZIP 或按 GitHub 描述下载固定提交 |
+| 腾讯 SkillHub | `skillhub.cn`、`skillhub.cloud.tencent.com` 的 `/skills/slug` 或 `/skills/owner/slug`，校验作者后下载固定版本 |
+| SkillsMP | `/skills/...`、`/creators/...` 详情页，提取唯一的源仓库安装信息；页面被限制或信息不唯一时请改用 GitHub 目录链接 |
+
+`skill_github_token` 为可选 GitHub 凭证，支持有读取权限的私有仓库及提高 API 限额。使用细粒度 Token 时，为目标仓库授予 Contents 读取权限即可。Token 只发送到 `api.github.com`，私有仓库请使用仓库或目录链接。`skillhub_api_key` 为可选腾讯 SkillHub 接口凭证。凭证不进入报告，不传给模型或跨站重定向。
+
+下载只允许 HTTPS 公网地址，限制大小、重定向和总耗时；网络环境需要能直接解析并访问这些来源。指向内网或 Fake-IP 的 DNS 结果会被拒绝。下载过程中不执行市场提供的 CLI 安装命令。报告附原始来源、实际版本/提交和内容指纹；来源不可用时返回失败报告，`--force` 不会绕过下载或路径检查。
+
 `install_skill`、`update_skill_from_zip`、`/skill install` 和 `/skill update` 共用扫描流程。
 ZIP 在正式写入前检查整个包；单文件更新在临时候选内容中合并更新，再检查整个 Skill。
-静态扫描不会执行 Skill 脚本、调用模型或联网获取依赖。报告由选定的审查模型或当前会话主模型解释。
+静态扫描不会执行 Skill 脚本、调用模型或联网获取依赖。链接下载完成后才进入静态扫描，报告由选定的审查模型或当前会话主模型解释。
 
 - 命令入口先返回报告，不写入正式目录。默认等待 300 秒，可通过 `skill_confirm_timeout` 调整；只有同一会话发起者发送当前语言对应的纯文本确认词才执行。空格、换行、标点、大小写变体、同义回复或附带附件都不算确认，也不延长等待。超时不安装。
 - 命令默认拒绝高风险和不完整扫描；显式传入 `--force` 可忽略内容分析结果，但仍展示报告并等待确认。不安全路径、包结构和输入大小上限不能绕过。同一条消息可上传多个文件，报告后确认待安装列表；等待期间不能再追加文件。
@@ -120,6 +144,8 @@ python3 -m unittest tests.test_skill_scan tests.test_scan_delivery tests.test_sc
 ```bash
 SKILL_SCAN_ASTRBOT_TESTS=1 python -m unittest tests.test_astrbot_integration -v
 ```
+
+来源解析及下载边界测试使用模拟 HTTP 响应：`python -m unittest tests.test_skill_sources -v`（需要 aiohttp）。真实公网下载检查可通过 `SKILL_SOURCES_LIVE=1 python -m unittest tests.test_skill_sources_live -v` 单独运行，只下载、不安装或执行内容。
 
 ### LLM 对话中使用
 

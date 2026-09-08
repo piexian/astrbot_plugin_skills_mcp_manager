@@ -235,7 +235,104 @@ class AstrBotIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_english_wrong_word_does_not_extend_timeout(self):
         await self._exercise_confirmation("timeout", language="English")
 
-    async def _exercise_confirmation(self, scenario, language="简体中文"):
+    async def test_link_command_waits_for_confirmation_before_installing(self):
+        await self._exercise_confirmation("exact", link=True)
+
+    async def test_link_in_upload_session_waits_for_confirmation(self):
+        await self._exercise_confirmation("exact", link="interactive")
+
+    async def test_link_download_failure_never_creates_candidate(self):
+        from importlib import import_module
+
+        module = import_module(f"{PACKAGE}.services.skill_sources")
+        self.plugin.skill_sources.resolve = AsyncMock(
+            side_effect=module.SourceError("来源返回 HTTP 404")
+        )
+        self.plugin.scan_delivery.deliver = AsyncMock()
+        event = Event()
+        event.role = "admin"
+        result, candidate = await self.plugin._prepare_skill_link(
+            event, "https://github.com/owner/missing"
+        )
+        self.assertIsNone(candidate)
+        self.assertEqual(result["scan"]["status"], "incomplete")
+        self.plugin.scan_delivery.deliver.assert_awaited_once_with(event, result)
+
+    async def test_link_update_uses_target_name_and_preserves_state(self):
+        module = importlib.import_module(f"{PACKAGE}.services.skill_sources")
+        await self.plugin.skill_installer.run(self.manager, self.archive())
+        self.manager.set_skill_active("demo", False)
+        self.plugin.skill_sources.resolve = AsyncMock(
+            return_value=module.SourceBundle(
+                "upstream-name",
+                {"SKILL.md": b"Updated from link", "scripts/run.py": b"print('ok')"},
+                {"url": "https://github.com/owner/repo", "commit": "a" * 40},
+            )
+        )
+        self.plugin.scan_delivery.deliver = AsyncMock()
+        event = Event()
+        event.role = "admin"
+        with patch.object(self.main, "SkillManager", return_value=self.manager):
+            result, candidate = await self.plugin._prepare_skill_link(
+                event, "https://github.com/owner/repo", skill_name="demo"
+            )
+        self.assertIsNotNone(candidate)
+        self.assertEqual(result["source"]["commit"], "a" * 40)
+        self.assertNotEqual(
+            Path(self.manager.skills_root, "demo", "SKILL.md").read_bytes(),
+            b"Updated from link",
+        )
+        committed = await self.plugin.skill_installer.commit(candidate)
+        self.assertTrue(committed["ok"])
+        self.assertEqual(
+            Path(self.manager.skills_root, "demo", "SKILL.md").read_bytes(),
+            b"Updated from link",
+        )
+        self.assertFalse(self.manager._load_config()["skills"]["demo"]["active"])
+
+    def test_command_link_arguments_preserve_force_upload_syntax(self):
+        self.assertEqual(
+            self.main._skill_link_arguments("--force", "", ""), ("", "", True)
+        )
+        self.assertEqual(
+            self.main._skill_link_arguments(
+                "https://github.com/o/r", "name", "--force"
+            ),
+            ("https://github.com/o/r", "name", True),
+        )
+        with self.assertRaises(ValueError):
+            self.main._skill_link_arguments("curl", "bash", "")
+
+    async def test_duplicate_link_command_cannot_replace_preparing_session(self):
+        event = Event()
+        event.get_sender_id = lambda: "alice"
+        event.stop_event = Mock()
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def running(*args, **kwargs):
+            entered.set()
+            await release.wait()
+
+        self.plugin._run_skill_upload_session = AsyncMock(side_effect=running)
+        task = asyncio.create_task(
+            self.plugin._skill_upload_session(
+                event, source="https://github.com/owner/first"
+            )
+        )
+        try:
+            await entered.wait()
+            await self.plugin._skill_upload_session(
+                event, source="https://github.com/owner/second"
+            )
+            self.assertEqual(self.plugin._run_skill_upload_session.await_count, 1)
+            self.assertIn("已有", event.sent[-1])
+        finally:
+            release.set()
+            await task
+        self.assertFalse(self.plugin._active_skill_sessions)
+
+    async def _exercise_confirmation(self, scenario, language="简体中文", link=False):
         import astrbot.api.message_components as Comp
         from astrbot.core.utils.session_waiter import SessionWaiter, USER_SESSIONS
 
@@ -284,6 +381,15 @@ class AstrBotIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(plugin.scan_delivery.language, language)
         plugin.skill_confirm_timeout = 0.1 if scenario == "timeout" else 3
         plugin.scan_delivery.deliver = AsyncMock()
+        if link:
+            source_module = importlib.import_module(f"{PACKAGE}.services.skill_sources")
+            plugin.skill_sources.resolve = AsyncMock(
+                return_value=source_module.SourceBundle(
+                    "demo",
+                    {"SKILL.md": b"Normal"},
+                    {"url": "https://github.com/owner/repo", "commit": "a" * 40},
+                )
+            )
         origin = CommandEvent("/skill install")
         session_filter = self.main._SkillSessionFilter()
         key = session_filter.filter(origin)
@@ -300,11 +406,21 @@ class AstrBotIntegrationTests(unittest.IsolatedAsyncioTestCase):
             patch.object(self.main, "_try_sync_to_sandboxes"),
         ):
             task = asyncio.create_task(
-                plugin._skill_upload_session(origin, force=scenario == "force")
+                plugin._skill_upload_session(
+                    origin,
+                    force=scenario == "force",
+                    source="https://github.com/owner/repo" if link is True else "",
+                )
             )
             try:
                 await until(lambda: key in USER_SESSIONS)
-                await SessionWaiter.trigger(key, upload)
+                if link == "interactive":
+                    upload = CommandEvent("https://github.com/owner/repo")
+                    await SessionWaiter.trigger(key, upload)
+                elif link is not True:
+                    await SessionWaiter.trigger(key, upload)
+                else:
+                    upload = origin
                 self.assertFalse(Path(self.manager.skills_root, "demo").exists())
                 if scenario != "blocked":
                     self.assertIn(f"“{word}”", upload.sent[-1])

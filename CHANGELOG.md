@@ -5,6 +5,8 @@
 ## [Unreleased]
 
 ### Added
+- 命令与交互模式支持 GitHub、skills.sh、ClawHub、腾讯 SkillHub 和 SkillsMP 链接安装/更新，下载完整候选内容后继续扫描和确认。
+- 新增可选 GitHub Token 和 SkillHub API Key，支持私有 GitHub 仓库读取与 API 限流额度提升。
 - 新增日语界面翻译及审查回复语言配置，支持简体中文、English、日本語，确认词分别为 `确认`、`confirm`、`確認`，仅精确匹配。
 - 可选配置 Skill 审查模型，命令指定后直接返回其文本报告，留空使用主模型；AI 工具仍返回报告及审阅意见。
 - 本插件的 Skill 安装、ZIP 更新和单文件更新统一执行写入前离线静态扫描，返回风险项、完整性、规则版本和候选内容指纹。

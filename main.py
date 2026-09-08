@@ -9,6 +9,9 @@ import json
 import os
 import re
 import time
+import shlex
+import tempfile
+import zipfile
 from pathlib import Path
 
 from astrbot.api import AstrBotConfig, logger, star
@@ -24,6 +27,7 @@ from .services.scan_delivery import ScanDelivery
 from .services.scan_review import ScanReview
 from .services.review_language import confirmation_word
 from .services.skill_install import SkillInstallService, failed_result
+from .services.skill_sources import SkillSources, SourceError
 from .tools.skill_tools import _try_sync_to_sandboxes
 from .tools.utils import mask_sensitive
 from .tools import (
@@ -53,6 +57,17 @@ class _SkillSessionFilter(SessionFilter):
         )
 
 
+def _skill_link_arguments(*args):
+    values = [value for value in args if value and value != "--force"]
+    if len(values) > 2 or (values and not values[0].startswith("https://")):
+        raise ValueError("参数无效")
+    return (
+        values[0] if values else "",
+        values[1] if len(values) == 2 else "",
+        "--force" in args,
+    )
+
+
 class Main(star.Star):
     """Skills & MCP Manager Plugin"""
 
@@ -63,10 +78,16 @@ class Main(star.Star):
         self.skill_installer = SkillInstallService(
             config.get("skill_scan_mode", "enforce")
         )
+        self.skill_sources = SkillSources(
+            config.get("skill_github_token", ""), config.get("skillhub_api_key", "")
+        )
+        self._active_skill_sessions = set()
         review_language = config.get("skill_review_language", "简体中文")
         self.scan_delivery = ScanDelivery(self, language=review_language)
         self.scan_review = ScanReview(
-            context, config.get("skill_review_provider_id", ""), language=review_language
+            context,
+            config.get("skill_review_provider_id", ""),
+            language=review_language,
         )
         self.skill_confirm_timeout = max(
             1, int(config.get("skill_confirm_timeout", 300))
@@ -148,6 +169,43 @@ class Main(star.Star):
                     os.remove(file_path)
                 except OSError:
                     logger.warning("Could not remove temporary skill upload")
+        return await self._show_skill_report(event, result), prepared
+
+    async def _prepare_skill_link(
+        self, event, url, selection="", *, skill_name="", force=False
+    ):
+        prepared = None
+        try:
+            if event.role != "admin":
+                result = failed_result(
+                    "只有管理员可以安装或更新 Skill。", code="permission_denied"
+                )
+            else:
+                bundle = await self.skill_sources.resolve(url, selection)
+                with tempfile.TemporaryDirectory(prefix="skill_link_") as tmp:
+                    archive = Path(tmp) / "skill.zip"
+                    name = skill_name or bundle.name
+                    with zipfile.ZipFile(archive, "w", zipfile.ZIP_STORED) as zf:
+                        for path, content in bundle.files.items():
+                            zf.writestr(name + "/" + path, content)
+                    result, prepared = await self.skill_installer.prepare(
+                        SkillManager(),
+                        str(archive),
+                        operation="replace" if skill_name else "install",
+                        skill_name=skill_name,
+                        force=force,
+                    )
+                result["source"] = bundle.provenance
+        except SourceError as exc:
+            result = failed_result(str(exc), code="source_unavailable")
+        except Exception:
+            logger.exception("Skill link preparation failed")
+            result = failed_result(
+                "链接解析或下载失败，未安装 Skill。", code="source_unavailable"
+            )
+        return await self._show_skill_report(event, result), prepared
+
+    async def _show_skill_report(self, event, result):
         result = await self.scan_review.review(result)
         if self.scan_review.provider_id:
             review = result["model_review"]
@@ -162,7 +220,7 @@ class Main(star.Star):
                 )
         else:
             await self.scan_delivery.deliver(event, result)
-        return result, prepared
+        return result
 
     # ==================== Utility methods ====================
 
@@ -361,35 +419,91 @@ class Main(star.Star):
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @skill_group.command("install")
-    async def skill_install(self, event: AstrMessageEvent, force: str = "") -> None:
+    async def skill_install(
+        self,
+        event: AstrMessageEvent,
+        source: str = "",
+        selection: str = "",
+        force: str = "",
+    ) -> None:
         """上传 Skill，先审查再等待精确确认。"""
-        if force not in {"", "--force"}:
-            await event.send(event.plain_result("用法: /skill install [--force]"))
+        try:
+            source, selection, forced = _skill_link_arguments(source, selection, force)
+        except ValueError:
+            await event.send(
+                event.plain_result("用法: /skill install [链接] [技能名] [--force]")
+            )
             event.stop_event()
             return
-        await self._skill_upload_session(event, force=force == "--force")
+        await self._skill_upload_session(
+            event, force=forced, source=source, selection=selection
+        )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @skill_group.command("update")
     async def skill_update(
-        self, event: AstrMessageEvent, name: str = "", force: str = ""
+        self,
+        event: AstrMessageEvent,
+        name: str = "",
+        source: str = "",
+        selection: str = "",
+        force: str = "",
     ) -> None:
         """上传更新，审查后等待确认；强制模式仍需要确认。"""
-        if (
-            not name
-            or not _SKILL_NAME_RE.fullmatch(name)
-            or name in {".", ".."}
-            or force not in {"", "--force"}
-        ):
+        try:
+            source, selection, forced = _skill_link_arguments(source, selection, force)
+        except ValueError:
+            await event.send(
+                event.plain_result(
+                    "用法: /skill update <名称> [链接] [技能名] [--force]"
+                )
+            )
+            event.stop_event()
+            return
+        if not name or not _SKILL_NAME_RE.fullmatch(name) or name in {".", ".."}:
             await event.send(event.plain_result("用法: /skill update <名称> [--force]"))
             event.stop_event()
             return
         await self._skill_upload_session(
-            event, skill_name=name, force=force == "--force"
+            event, skill_name=name, force=forced, source=source, selection=selection
         )
 
     async def _skill_upload_session(
-        self, origin: AstrMessageEvent, *, skill_name: str = "", force: bool = False
+        self,
+        origin: AstrMessageEvent,
+        *,
+        skill_name: str = "",
+        force: bool = False,
+        source: str = "",
+        selection: str = "",
+    ) -> None:
+        key = (origin.unified_msg_origin, origin.get_sender_id())
+        if key in self._active_skill_sessions:
+            await origin.send(
+                origin.plain_result("已有 Skill 安装或更新任务，请先完成当前任务。")
+            )
+            origin.stop_event()
+            return
+        self._active_skill_sessions.add(key)
+        try:
+            await self._run_skill_upload_session(
+                origin,
+                skill_name=skill_name,
+                force=force,
+                source=source,
+                selection=selection,
+            )
+        finally:
+            self._active_skill_sessions.discard(key)
+
+    async def _run_skill_upload_session(
+        self,
+        origin: AstrMessageEvent,
+        *,
+        skill_name: str = "",
+        force: bool = False,
+        source: str = "",
+        selection: str = "",
     ) -> None:
         import astrbot.api.message_components as Comp
 
@@ -408,7 +522,21 @@ class Main(star.Star):
                 candidate.consumed = True
             pending.clear()
 
-        @session_waiter(timeout=120, record_history_chains=False)
+        async def confirmation_prompt(event):
+            names = [p.result["data"]["skill_name"] for p in pending]
+            await event.send(
+                event.plain_result(
+                    "尚未安装/更新。待确认内容："
+                    + "；".join(names)
+                    + ("\n强制模式：将忽略内容分析结果，但仍需确认。" if force else "")
+                    + f"\n请在 {self.skill_confirm_timeout} 秒内仅发送“{confirm_word}”；超时不安装。"
+                )
+            )
+
+        @session_waiter(
+            timeout=self.skill_confirm_timeout if source else 120,
+            record_history_chains=False,
+        )
         async def waiter(
             controller: SessionController, event: AstrMessageEvent
         ) -> None:
@@ -446,10 +574,39 @@ class Main(star.Star):
             attachments = [
                 msg for msg in event.get_messages() if isinstance(msg, Comp.File)
             ]
-            if not attachments:
+            link = event.message_str.strip()
+            if not attachments and link.startswith("https://"):
+                try:
+                    args = shlex.split(link)
+                    if len(args) > 2:
+                        raise ValueError()
+                except ValueError:
+                    await event.send(event.plain_result("请发送：链接 [技能名]。"))
+                    return
+                controller.keep(timeout=180, reset_timeout=True)
+                result, candidate = await self._prepare_skill_link(
+                    event,
+                    args[0],
+                    args[1] if len(args) > 1 else "",
+                    skill_name=skill_name,
+                    force=force,
+                )
+                if controller.future.done():
+                    if candidate is not None:
+                        candidate.files.clear()
+                        candidate.consumed = True
+                    discard()
+                    return
+                if candidate is not None:
+                    pending.append(candidate)
+                else:
+                    await event.send(
+                        event.plain_result("该链接未进入待安装队列：" + result["error"])
+                    )
+            elif not attachments:
                 await event.send(
                     event.plain_result(
-                        "请发送 ZIP 文件；更新也可发送单个文件。发送“取消”结束。"
+                        "请发送技能链接或 ZIP 文件；更新也可发送单个文件。发送“取消”结束。"
                     )
                 )
                 return
@@ -485,15 +642,7 @@ class Main(star.Star):
             if not pending:
                 controller.stop()
                 return
-            names = [p.result["data"]["skill_name"] for p in pending]
-            await event.send(
-                event.plain_result(
-                    "尚未安装/更新。待确认内容："
-                    + "；".join(names)
-                    + ("\n强制模式：将忽略内容分析结果，但仍需确认。" if force else "")
-                    + f"\n请在 {self.skill_confirm_timeout} 秒内仅发送“{confirm_word}”；超时不安装。"
-                )
-            )
+            await confirmation_prompt(event)
             if controller.future.done():
                 discard()
                 return
@@ -509,7 +658,12 @@ class Main(star.Star):
                         if skill_name
                         else "Skill 安装模式"
                     )
-                    + f"\n请在 120 秒内上传文件。将先返回报告，再等待“{confirm_word}”。"
+                    + (
+                        "\n正在解析并下载技能链接。"
+                        if source
+                        else "\n请在 120 秒内发送技能链接或上传文件。"
+                    )
+                    + f"将先返回报告，再等待“{confirm_word}”。"
                     + (
                         "\n已启用 --force，内容分析不阻断安装；路径和包结构检查仍执行。"
                         if force
@@ -517,6 +671,21 @@ class Main(star.Star):
                     )
                 )
             )
+            if source:
+                result, candidate = await self._prepare_skill_link(
+                    origin,
+                    source,
+                    selection,
+                    skill_name=skill_name,
+                    force=force,
+                )
+                if candidate is None:
+                    await origin.send(origin.plain_result("未安装：" + result["error"]))
+                    return
+                pending.append(candidate)
+                await confirmation_prompt(origin)
+                phase = "confirm"
+                deadline = time.monotonic() + self.skill_confirm_timeout
             await waiter(origin, session_filter=_SkillSessionFilter())
             if confirmed:
                 for candidate in pending:

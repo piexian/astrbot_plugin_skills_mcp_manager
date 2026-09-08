@@ -5,6 +5,14 @@
     "desc": "関数ツールとコマンドで AstrBot の Skills と MCP サーバーを管理します。Skill のライフサイクル管理、MCP サーバー設定、組み込みの管理用 Skill に対応しています。"
   },
   "config": {
+    "skill_github_token": {
+      "description": "GitHub Token（任意）",
+      "hint": "非公開リポジトリからのインストールや API 制限の緩和に使用します。"
+    },
+    "skillhub_api_key": {
+      "description": "SkillHub API Key（任意）",
+      "hint": "Tencent SkillHub の API アクセス認証情報。"
+    },
     "skill_review_language": {
       "description": "審査レポートの言語",
       "hint": "レポートの言語と対応する確認キーワードを選択します。"
