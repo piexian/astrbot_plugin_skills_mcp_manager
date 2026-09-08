@@ -5,13 +5,37 @@
     "desc": "为 AstrBot 提供函数工具和指令来管理 AstrBot Skills 和 MCP 服务器，支持 Skills 生命周期管理、MCP 服务器配置管理，以及内置管理 Skill。"
   },
   "config": {
+    "skill_github_token": {
+      "description": "GitHub Token（可选）",
+      "hint": "用于私有仓库安装或提高 API 限额。"
+    },
+    "skillhub_api_key": {
+      "description": "SkillHub API Key（可选）",
+      "hint": "腾讯 SkillHub 的接口访问凭证。"
+    },
+    "skill_review_language": {
+      "description": "审查回复语言",
+      "hint": "选择报告语言及对应的确认词。"
+    },
+    "skill_confirm_timeout": {
+      "description": "Skill 命令确认等待时间（秒）",
+      "hint": "报告返回后等待确认词的秒数，超时不安装。"
+    },
+    "skill_review_provider_id": {
+      "description": "Skill 审查模型（可选）",
+      "hint": "留空使用主模型；指定后，命令直接返回该模型的报告。"
+    },
+    "skill_scan_mode": {
+      "description": "Skill 静态扫描策略",
+      "hint": "AI 工具的扫描策略：enforce 拦截风险，report_only 仅报告。"
+    },
     "diff_mode": {
       "description": "编辑模式",
-      "hint": "启用后，AI 编辑 MCP 配置时需要提供原始文本和替换文本的 diff 对，而非完整配置。可防止 AI 意外覆盖整个配置。Skill 文件编辑请使用 AstrBot 新版内置文件工具。"
+      "hint": "使用差异替换编辑 MCP 配置，避免整份覆盖。"
     },
     "diff_match_threshold": {
       "description": "文本匹配阈值",
-      "hint": "MCP 配置原始文本匹配度百分比。100 表示必须完全匹配，较低值允许 AI 提供的原始文本有少量偏差。仅在 Diff 模式启用时生效。"
+      "hint": "差异替换的文本匹配度；100 为完全匹配。"
     }
   }
 }

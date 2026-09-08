@@ -18,6 +18,9 @@ from astrbot.core.astr_agent_context import AstrAgentContext
 from astrbot.core.skills.skill_manager import SkillManager
 from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
 
+from ..services.scan_review import ScanReview
+from ..services.skill_install import SkillInstallService, failed_result
+
 _SKILL_NAME_RE = re.compile(r"^[\w.-]+$")
 
 _REFRESH_HINT = (
@@ -86,6 +89,7 @@ def _detect_runtime(context: ContextWrapper[AstrAgentContext]) -> str:
         )
         return cfg.get("provider_settings", {}).get("computer_use_runtime", "local")
     except Exception:
+        logger.debug("Could not read runtime configuration; using local", exc_info=True)
         return "local"
 
 
@@ -100,7 +104,7 @@ def _try_sync_to_sandboxes() -> None:
 
         asyncio.ensure_future(sync_skills_to_active_sandboxes())
     except Exception:
-        pass
+        logger.warning("Could not schedule Skill synchronization", exc_info=True)
 
 
 async def _resolve_zip_path(
@@ -230,8 +234,8 @@ class ListSkillsTool(FunctionTool):
                 for s in skills
             ]
             return _ok(data={"skills": result})
-        except Exception as e:
-            logger.error(f"list_skills failed: {e}")
+        except Exception:
+            logger.exception("list_skills failed")
             return _err("列出 Skills 失败，请稍后重试。")
 
 
@@ -273,8 +277,8 @@ class EnableSkillTool(FunctionTool):
             mgr = _get_skill_manager()
             mgr.set_skill_active(skill_name, True)
             return _ok(message=f"已启用 Skill: {skill_name}。{_REFRESH_HINT}")
-        except Exception as e:
-            logger.error(f"enable_skill failed: {e}")
+        except Exception:
+            logger.exception("enable_skill failed")
             return _err("启用 Skill 失败，请检查 Skill 名称是否正确。")
 
 
@@ -318,8 +322,8 @@ class DisableSkillTool(FunctionTool):
             mgr = _get_skill_manager()
             mgr.set_skill_active(skill_name, False)
             return _ok(message=f"已禁用 Skill: {skill_name}。{_REFRESH_HINT}")
-        except Exception as e:
-            logger.error(f"disable_skill failed: {e}")
+        except Exception:
+            logger.exception("disable_skill failed")
             return _err("禁用 Skill 失败，请检查 Skill 名称是否正确。")
 
 
@@ -371,8 +375,8 @@ class DeleteSkillTool(FunctionTool):
             mgr = _get_skill_manager()
             mgr.delete_skill(skill_name)
             return _ok(message=f"已删除 Skill: {skill_name}。{_REFRESH_HINT}")
-        except Exception as e:
-            logger.error(f"delete_skill failed: {e}")
+        except Exception:
+            logger.exception("delete_skill failed")
             return _err("删除 Skill 失败，请检查 Skill 名称是否正确。")
 
 
@@ -390,7 +394,11 @@ class InstallSkillTool(FunctionTool):
         "从 ZIP 文件安装 Skill。需要管理员权限。"
         "ZIP 可包含单个顶层文件夹或在根目录直接包含 SKILL.md。"
         "路径可以是本地绝对路径或沙盒路径（自动下载）。"
+        "安装前进行静态扫描，所有结果均包含 scan 报告；阻断时不会安装。"
+        "请按返回的 review_language 向用户说明审查结果。"
     )
+    installer: SkillInstallService = field(default_factory=SkillInstallService)
+    reviewer: ScanReview | None = None
     parameters: dict = field(
         default_factory=lambda: {
             "type": "object",
@@ -416,49 +424,37 @@ class InstallSkillTool(FunctionTool):
         **kwargs: Any,
     ) -> ToolExecResult:
         if err := _ensure_admin(context):
-            return err
+            return json.dumps(
+                failed_result(json.loads(err)["error"], code="permission_denied"),
+                ensure_ascii=False,
+            )
         if not zip_path:
-            return _err("zip_path 不能为空。")
+            return json.dumps(failed_result("zip_path 不能为空。"), ensure_ascii=False)
 
         tmp_file: str | None = None
         try:
             actual_zip_path, tmp_file = await _resolve_zip_path(zip_path, context)
-            mgr = _get_skill_manager()
-            install_kwargs: dict[str, Any] = {"overwrite": False}
-            if skill_name_hint:
-                install_kwargs["skill_name_hint"] = skill_name_hint
-            try:
-                skill_name = mgr.install_skill_from_zip(
-                    actual_zip_path, **install_kwargs
-                )
-            except TypeError:
-                # Backward compatibility: older SkillManager without overwrite/name hints
-                legacy_kwargs = {
-                    key: value
-                    for key, value in install_kwargs.items()
-                    if key != "overwrite"
-                }
-                try:
-                    skill_name = mgr.install_skill_from_zip(
-                        actual_zip_path, **legacy_kwargs
-                    )
-                except TypeError:
-                    skill_name = mgr.install_skill_from_zip(actual_zip_path)
-            _try_sync_to_sandboxes()
-            return _ok(
-                data={"skill_name": skill_name},
-                message=f"Skill 安装成功: {skill_name}。{_REFRESH_HINT}",
+            result = await self.installer.run(
+                _get_skill_manager(),
+                actual_zip_path,
+                skill_name_hint=skill_name_hint,
+                archive_name=Path(zip_path).name,
             )
-        except SkillZipPathError as e:
-            logger.error(f"install_skill failed: {e}")
-            return _err(str(e))
-        except FileExistsError:
-            return _err(
-                "同名 Skill 已存在，请先删除或使用 update_skill_from_zip 更新。"
+            if result["ok"]:
+                _try_sync_to_sandboxes()
+            if self.reviewer is not None:
+                result = await self.reviewer.review(result)
+            return json.dumps(result, ensure_ascii=False)
+        except SkillZipPathError:
+            logger.exception("install_skill failed")
+            return json.dumps(
+                failed_result("无法取得 Skill ZIP 文件。"), ensure_ascii=False
             )
-        except Exception as e:
-            logger.exception(f"install_skill failed: {e}")
-            return _unknown_err("安装 Skill 失败", e)
+        except Exception:
+            logger.exception("install_skill failed")
+            return json.dumps(
+                failed_result("安装准备失败，请查看日志。"), ensure_ascii=False
+            )
         finally:
             if tmp_file and os.path.exists(tmp_file):
                 try:
@@ -479,7 +475,11 @@ class UpdateSkillFromZipTool(FunctionTool):
     name: str = "update_skill_from_zip"
     description: str = (
         "从 ZIP 文件更新已存在的 Skill。需要管理员权限。会覆盖 Skill 的所有文件。"
+        "更新前进行静态扫描，所有结果均包含 scan 报告；阻断时保留旧版本。"
+        "请按返回的 review_language 向用户说明审查结果。"
     )
+    installer: SkillInstallService = field(default_factory=SkillInstallService)
+    reviewer: ScanReview | None = None
     parameters: dict = field(
         default_factory=lambda: {
             "type": "object",
@@ -510,90 +510,50 @@ class UpdateSkillFromZipTool(FunctionTool):
         **kwargs: Any,
     ) -> ToolExecResult:
         if err := _ensure_admin(context):
-            return err
+            return json.dumps(
+                failed_result(json.loads(err)["error"], code="permission_denied"),
+                ensure_ascii=False,
+            )
         if not confirm:
-            return _err("请将 confirm 参数设为 true 以确认覆盖更新操作。")
+            return json.dumps(
+                failed_result(
+                    "请将 confirm 参数设为 true 以确认覆盖更新操作。",
+                    code="confirmation_required",
+                ),
+                ensure_ascii=False,
+            )
         if err := _validate_skill_name(skill_name):
-            return err
+            return json.dumps(
+                failed_result(json.loads(err)["error"], code="invalid_name"),
+                ensure_ascii=False,
+            )
         if not zip_path:
-            return _err("zip_path 不能为空。")
+            return json.dumps(failed_result("zip_path 不能为空。"), ensure_ascii=False)
 
         tmp_file: str | None = None
         try:
             actual_zip_path, tmp_file = await _resolve_zip_path(zip_path, context)
-            mgr = _get_skill_manager()
-            skills_root = Path(mgr.skills_root)
-            skill_dir = skills_root / skill_name
-            if not skill_dir.exists():
-                return _err(
-                    f"Skill 不存在: {skill_name}。请使用 install_skill 安装新 Skill。"
-                )
-
-            # Pre-validate: check ZIP skill name matches target before overwriting
-            import zipfile
-
-            with zipfile.ZipFile(actual_zip_path) as zf:
-                members = [
-                    n.replace("\\", "/")
-                    for n in zf.namelist()
-                    if n and not n.endswith("/")
-                ]
-                if members:
-                    top_dirs = {
-                        Path(n).parts[0]
-                        for n in members
-                        if n.strip() and Path(n).parts[0] not in ("__MACOSX",)
-                    }
-                    if len(top_dirs) == 1:
-                        zip_skill_name = next(iter(top_dirs))
-                        if zip_skill_name != skill_name:
-                            return _err(
-                                f"ZIP 内 Skill 名 '{zip_skill_name}' 与目标 "
-                                f"'{skill_name}' 不一致，请检查 ZIP 文件。"
-                            )
-                    else:
-                        # Files are in the ZIP root (no single top-level dir)
-                        # or multiple top-level dirs exist — ambiguous structure
-                        return _err(
-                            f"ZIP 文件结构不明确：期望包含单一顶层目录 "
-                            f"'{skill_name}'，但发现 {len(top_dirs)} 个"
-                            f"顶层条目 ({', '.join(sorted(top_dirs)[:5])})。"
-                            f"请将 Skill 文件放在以 Skill 名命名的目录中再打包。"
-                        )
-
-            # Use install_skill_from_zip with overwrite=True
-            installed_name = mgr.install_skill_from_zip(actual_zip_path, overwrite=True)
-
-            # Post-install verification: ensure installed name matches target
-            if installed_name != skill_name:
-                # Rollback: remove the incorrectly installed skill
-                try:
-                    installed_dir = skills_root / installed_name
-                    if installed_dir.exists():
-                        import shutil
-
-                        shutil.rmtree(installed_dir)
-                except Exception as rollback_err:
-                    logger.error(
-                        f"update_skill_from_zip rollback failed for "
-                        f"'{installed_name}': {rollback_err}"
-                    )
-                return _err(
-                    f"ZIP 实际安装到 '{installed_name}'，与目标 "
-                    f"'{skill_name}' 不一致，已回滚。请检查 ZIP 文件结构。"
-                )
-
-            _try_sync_to_sandboxes()
-            return _ok(
-                data={"skill_name": installed_name},
-                message=f"已从 ZIP 更新 Skill: {installed_name}。{_REFRESH_HINT}",
+            result = await self.installer.run(
+                _get_skill_manager(),
+                actual_zip_path,
+                operation="replace",
+                skill_name=skill_name,
             )
-        except SkillZipPathError as e:
-            logger.error(f"update_skill_from_zip failed: {e}")
-            return _err(str(e))
-        except Exception as e:
-            logger.exception(f"update_skill_from_zip failed: {e}")
-            return _unknown_err("从 ZIP 更新 Skill 失败", e)
+            if result["ok"]:
+                _try_sync_to_sandboxes()
+            if self.reviewer is not None:
+                result = await self.reviewer.review(result)
+            return json.dumps(result, ensure_ascii=False)
+        except SkillZipPathError:
+            logger.exception("update_skill_from_zip failed")
+            return json.dumps(
+                failed_result("无法取得 Skill ZIP 文件。"), ensure_ascii=False
+            )
+        except Exception:
+            logger.exception("update_skill_from_zip failed")
+            return json.dumps(
+                failed_result("更新准备失败，请查看日志。"), ensure_ascii=False
+            )
         finally:
             if tmp_file and os.path.exists(tmp_file):
                 try:

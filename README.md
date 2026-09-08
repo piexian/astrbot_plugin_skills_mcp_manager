@@ -14,10 +14,12 @@
 ## 功能
 
 - 13 个 LLM Tool，覆盖 Skills 和 MCP 全生命周期管理
-- 支持国际化（中文 / English），Dashboard 根据当前语言自动切换
+- 支持国际化（中文 / English / 日本語），Dashboard 根据当前语言自动切换
 - `/skill` 命令组，用户可直接通过指令管理 Skills
 - `/mcp` 命令组，用户可直接通过指令管理 MCP 服务器
 - 内置英文版 `skills-mcp-manager` Skill，引导 AI 正确调用管理工具
+- 本插件安装、更新 Skill 前执行离线静态扫描，支持可选审查模型和命令二次确认
+- 支持通过 GitHub、skills.sh、ClawHub、腾讯 SkillHub、SkillsMP 链接下载 Skill
 
 ## 安装
 
@@ -70,8 +72,8 @@ https://github.com/piexian/astrbot_plugin_skills_mcp_manager
 /skill del <名称>      # 删除 Skill
 /skill files <名称>    # 查看文件结构
 /skill read <名称> <文件>  # 读取文件内容
-/skill install         # 交互式安装（发送 ZIP 文件）
-/skill update <名称>   # 交互式更新（发送 ZIP 文件）
+/skill install [链接] [技能名] [--force]       # 链接安装或进入上传模式
+/skill update <名称> [链接] [技能名] [--force] # 链接更新或进入上传模式
 
 /mcp ls                # 列出所有 MCP 服务器
 /mcp config <名称>     # 查看配置详情
@@ -81,6 +83,69 @@ https://github.com/piexian/astrbot_plugin_skills_mcp_manager
 /mcp add <名称>        # 交互式添加（发送 JSON 配置）
 /mcp update <名称>     # 交互式更新（发送 JSON 配置）
 ```
+
+### Skill 安装与更新扫描
+
+可直接发送命令，不需要 AI 调用工具下载安装：
+
+```text
+/skill install https://github.com/anthropics/skills/tree/main/skills/frontend-design
+/skill install https://skills.sh/vercel-labs/agent-skills/vercel-composition-patterns
+/skill install https://github.com/anthropics/skills frontend-design
+/skill update frontend-design https://github.com/anthropics/skills/tree/main/skills/frontend-design
+```
+
+省略链接进入交互模式后，也可以发送 `链接 [技能名]` 或上传 ZIP。仓库中有多个 Skill 时必须指定唯一技能名或目录；`--force` 仍只在发起命令时指定，确认阶段不接受更改参数。
+
+| 来源 | 支持的链接与处理方式 |
+|------|--------------------|
+| GitHub | 仓库、`tree` 目录、`blob`/raw `SKILL.md`，以及归档/Release 下载链接。仓库内容固定提交，下载完整 Skill 目录并核对 Git blob 指纹 |
+| skills.sh | `/owner/repo/skill`，按清单名称定位真实目录，复用 GitHub 下载 |
+| ClawHub | `/owner/skills/slug` 或 `/owner/slug`，下载固定版本 ZIP 或按 GitHub 描述下载固定提交 |
+| 腾讯 SkillHub | `skillhub.cn`、`skillhub.cloud.tencent.com` 的 `/skills/slug` 或 `/skills/owner/slug`，校验作者后下载固定版本 |
+| SkillsMP | `/skills/...`、`/creators/...` 详情页，提取唯一的源仓库安装信息；页面被限制或信息不唯一时请改用 GitHub 目录链接 |
+
+`skill_github_token` 为可选 GitHub 凭证，支持有读取权限的私有仓库及提高 API 限额。使用细粒度 Token 时，为目标仓库授予 Contents 读取权限即可。Token 只发送到 `api.github.com`，私有仓库请使用仓库或目录链接。`skillhub_api_key` 为可选腾讯 SkillHub 接口凭证。凭证不进入报告，不传给模型或跨站重定向。
+
+下载只允许 HTTPS 公网地址，限制大小、重定向和总耗时；网络环境需要能直接解析并访问这些来源。指向内网或 Fake-IP 的 DNS 结果会被拒绝。下载过程中不执行市场提供的 CLI 安装命令。报告附原始来源、实际版本/提交和内容指纹；来源不可用时返回失败报告，`--force` 不会绕过下载或路径检查。
+
+`install_skill`、`update_skill_from_zip`、`/skill install` 和 `/skill update` 共用扫描流程。
+ZIP 在正式写入前检查整个包；单文件更新在临时候选内容中合并更新，再检查整个 Skill。
+静态扫描不会执行 Skill 脚本、调用模型或联网获取依赖。链接下载完成后才进入静态扫描，报告由选定的审查模型或当前会话主模型解释。
+
+- 命令入口先返回报告，不写入正式目录。默认等待 300 秒，可通过 `skill_confirm_timeout` 调整；只有同一会话发起者发送当前语言对应的纯文本确认词才执行。空格、换行、标点、大小写变体、同义回复或附带附件都不算确认，也不延长等待。超时不安装。
+- 命令默认拒绝高风险和不完整扫描；显式传入 `--force` 可忽略内容分析结果，但仍展示报告并等待确认。不安全路径、包结构和输入大小上限不能绕过。同一条消息可上传多个文件，报告后确认待安装列表；等待期间不能再追加文件。
+- `skill_review_provider_id` 留空时使用当前会话主模型；指定后，命令直接返回该模型的文本报告，不调用主模型，不安排主模型补投。指定模型失败时直接展示静态报告。审查模型只读取报告，不读取 Skill 全文。
+- `skill_review_language` 可选 `简体中文`、`English`、`日本語`，默认简体中文，用于模型审查报告。确认词分别固定为 `确认`、`confirm`、`確認`，每种语言只接受一个词，必须精确匹配。
+- AI 工具沿用原有确认方式，审阅意见和扫描报告仍返回主模型。`skill_scan_mode=enforce` 拦截高风险；`report_only` 允许完整扫描后的风险内容通过，两者均拒绝不完整扫描。不提供工具参数跳过扫描。
+- 启用、其他渠道安装、原生文件工具编辑和全局巡检不在拦截范围内。
+- 安装不覆盖同名 Skill，请使用更新入口；更新保留原有启用状态。被阻断的更新不会修改旧文件。
+
+初版包含中英文指令规则、下载后执行、敏感信息上传和基础 Python AST 分析。Python 数据流仅覆盖单文件内简单导入别名、赋值与调用，不覆盖复杂跨函数/跨文件传播。其他文本语言采用规则扫描。
+
+静态扫描设计参考了 [NVIDIA SkillSpector](https://github.com/NVIDIA/SkillSpector) 的规则分类、行为分析和扫描完整性处理。相关说明见 [NVIDIA 官方文档：安装前扫描 Agent Skills](https://docs.nvidia.com/skills/scanning-agent-skills)。本插件采用独立的轻量实现，检测范围以上述说明为准。
+
+资源上限：ZIP 原始大小 20 MiB、最多 1,000 个条目、单文件 2 MiB、内容总量 32 MiB、压缩比 200:1；Python AST 上限 250,000 字符及 50,000 节点。扫描有时间与工作量检查，超限返回不完整。初版不分析 ZIP64、嵌套压缩包、可执行二进制及非 UTF-8 文本。PNG 验证容器边界/校验和并检查可见文本后列为附件，不解码像素、不证明运行时安全；其他二进制图片暂按不支持处理。
+
+所有工具结果都包含 `scan`，分别报告 `status`（`complete` / `incomplete`）、`decision`（`allow` / `warn` / `block`）、规则版本、候选内容指纹、命中规则、文件/行号、限制原因和实际 `operation_status`。报告不回显完整源码或凭据值。**未发现风险不代表绝对安全，扫描通过不代表安装成功。**
+
+未指定审查模型时，命令报告和主模型回复写入对话历史；模型不可用时保留报告，在本会话后续请求补投。待确认内容只保存在内存，超时或重启即取消，补投报告不会恢复安装授权。确认后的安装结果由命令直接返回；等待期间原 Skill 被修改时，要求重新提交审查。
+
+### 开发验证
+
+纯离线测试不依赖 AstrBot：
+
+```bash
+python3 -m unittest tests.test_skill_scan tests.test_scan_delivery tests.test_scan_review -v
+```
+
+在已安装 AstrBot 的 Python 环境中运行入口集成测试（测试自行创建一次性 `ASTRBOT_ROOT`）：
+
+```bash
+SKILL_SCAN_ASTRBOT_TESTS=1 python -m unittest tests.test_astrbot_integration -v
+```
+
+来源解析及下载边界测试使用模拟 HTTP 响应：`python -m unittest tests.test_skill_sources -v`（需要 aiohttp）。真实公网下载检查可通过 `SKILL_SOURCES_LIVE=1 python -m unittest tests.test_skill_sources_live -v` 单独运行，只下载、不安装或执行内容。
 
 ### LLM 对话中使用
 
