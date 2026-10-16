@@ -45,10 +45,11 @@ from .tools import (
 )
 from .tools.skill_tools import (
     _try_sync_to_sandboxes,
+    call_list_skills,
+    check_workspace_only_conflict,
     format_skill_permission_error,
     get_plugin_skill_origins,
-    is_workspace_only_skill,
-    list_session_workspace_skills,
+    list_session_workspace_skills_with_status,
     resolve_session_workspace_root,
 )
 from .tools.utils import mask_sensitive
@@ -158,20 +159,19 @@ class Main(star.Star):
                 )
             else:
                 mgr = SkillManager()
-                workspace_skills = (
-                    await list_session_workspace_skills(
-                        mgr, getattr(event, "unified_msg_origin", ""), self.context
+                ws_conflict = (
+                    await check_workspace_only_conflict(
+                        mgr,
+                        skill_name,
+                        getattr(event, "unified_msg_origin", ""),
+                        self.context,
+                        "，不支持通过全局 Skill 管理更新。",
                     )
                     if skill_name
-                    else []
+                    else None
                 )
-                if skill_name and is_workspace_only_skill(
-                    mgr, skill_name, workspace_skills
-                ):
-                    result = failed_result(
-                        f"Skill '{skill_name}' 是当前会话工作区 Skill，不支持通过全局 Skill 管理更新。",
-                        code="readonly_skill",
-                    )
+                if ws_conflict:
+                    result = failed_result(ws_conflict, code="readonly_skill")
                 else:
                     file_path = await attachment.get_file()
                     result, prepared = await self.skill_installer.prepare(
@@ -205,20 +205,19 @@ class Main(star.Star):
                 )
             else:
                 mgr = SkillManager()
-                workspace_skills = (
-                    await list_session_workspace_skills(
-                        mgr, getattr(event, "unified_msg_origin", ""), self.context
+                ws_conflict = (
+                    await check_workspace_only_conflict(
+                        mgr,
+                        skill_name,
+                        getattr(event, "unified_msg_origin", ""),
+                        self.context,
+                        "，不支持通过全局 Skill 管理更新。",
                     )
                     if skill_name
-                    else []
+                    else None
                 )
-                if skill_name and is_workspace_only_skill(
-                    mgr, skill_name, workspace_skills
-                ):
-                    result = failed_result(
-                        f"Skill '{skill_name}' 是当前会话工作区 Skill，不支持通过全局 Skill 管理更新。",
-                        code="readonly_skill",
-                    )
+                if ws_conflict:
+                    result = failed_result(ws_conflict, code="readonly_skill")
                 else:
                     bundle = await self.skill_sources.resolve(url, selection)
                     with tempfile.TemporaryDirectory(prefix="skill_link_") as tmp:
@@ -288,8 +287,31 @@ class Main(star.Star):
             )
             return "local"
 
-    async def _resolve_readable_skill_dir(
+    async def _resolve_workspace_skill_dir(
         self, mgr: SkillManager, name: str, umo: str
+    ) -> tuple[Path | None, str]:
+        if not callable(getattr(mgr, "list_workspace_skills", None)) or not umo:
+            return None, ""
+        try:
+            ws_root = await resolve_session_workspace_root(umo, self.context)
+            if ws_root is None:
+                return None, ""
+            resolved_ws_root = Path(ws_root).resolve(strict=True)
+            ws_skills_root = (resolved_ws_root / "skills").resolve(strict=True)
+            ws_dir = (ws_skills_root / name).resolve(strict=True)
+            if (
+                ws_skills_root.is_relative_to(resolved_ws_root)
+                and ws_dir.is_relative_to(ws_skills_root)
+                and ws_dir.is_dir()
+                and (ws_dir / "SKILL.md").is_file()
+            ):
+                return ws_dir, "工作区级"
+        except Exception:
+            logger.debug("Could not resolve workspace skill directory", exc_info=True)
+        return None, ""
+
+    def _resolve_local_or_plugin_skill_dir(
+        self, mgr: SkillManager, name: str
     ) -> tuple[Path | None, str]:
         skills_root = Path(mgr.skills_root).resolve()
         local_dir = (skills_root / name).resolve()
@@ -300,27 +322,53 @@ class Main(star.Star):
         if callable(get_plugin_dir):
             plugin_dir = get_plugin_dir(name)
             if plugin_dir is not None and Path(plugin_dir).is_dir():
-                origins = get_plugin_skill_origins(mgr)
-                plugin_name = origins.get(name, ("", False))[0]
-                label = f"插件级:{plugin_name}" if plugin_name else "插件级"
-                return Path(plugin_dir).resolve(), label
+                resolved_plugin_dir = Path(plugin_dir).resolve()
+                allowed_roots: list[Path] = []
+                plugins_root = getattr(mgr, "plugins_root", None)
+                if plugins_root:
+                    allowed_roots.append(Path(plugins_root).resolve())
+                try:
+                    from astrbot.core.utils.astrbot_path import (
+                        get_astrbot_builtin_plugin_path,
+                    )
 
-        ws_root = await resolve_session_workspace_root(umo, self.context)
-        if ws_root is not None:
-            ws_skills_root = (ws_root / "skills").resolve(strict=False)
-            ws_dir = (ws_skills_root / name).resolve(strict=False)
-            if ws_dir.is_relative_to(ws_skills_root) and ws_dir.is_dir():
-                return ws_dir, "工作区级"
-
+                    allowed_roots.append(
+                        Path(get_astrbot_builtin_plugin_path()).resolve()
+                    )
+                except Exception:
+                    logger.debug(
+                        "Builtin plugin path helper unavailable", exc_info=True
+                    )
+                if any(
+                    resolved_plugin_dir.is_relative_to(root) for root in allowed_roots
+                ):
+                    origins = get_plugin_skill_origins(mgr)
+                    plugin_name = origins.get(name, ("", False))[0]
+                    label = f"插件级:{plugin_name}" if plugin_name else "插件级"
+                    return resolved_plugin_dir, label
         return None, ""
+
+    async def _resolve_readable_skill_dir(
+        self, mgr: SkillManager, name: str, umo: str, runtime: str = "local"
+    ) -> tuple[Path | None, str]:
+        if runtime == "local":
+            ws_dir, ws_label = await self._resolve_workspace_skill_dir(mgr, name, umo)
+            if ws_dir is not None:
+                return ws_dir, ws_label
+            return self._resolve_local_or_plugin_skill_dir(mgr, name)
+
+        dir_path, label = self._resolve_local_or_plugin_skill_dir(mgr, name)
+        if dir_path is not None:
+            return dir_path, label
+        return await self._resolve_workspace_skill_dir(mgr, name, umo)
 
     @skill_group.command("ls")
     async def skill_ls(self, event: AstrMessageEvent) -> None:
         """列出所有 Skills（全局、插件级与当前会话工作区分开展示）"""
         mgr = SkillManager()
         runtime = self._detect_runtime(event)
-        skills = mgr.list_skills(runtime=runtime)
-        workspace_skills = await list_session_workspace_skills(
+        skills = call_list_skills(mgr, runtime)
+        workspace_skills, ws_error = await list_session_workspace_skills_with_status(
             mgr, getattr(event, "unified_msg_origin", ""), self.context
         )
         plugin_origins = get_plugin_skill_origins(mgr)
@@ -369,7 +417,9 @@ class Main(star.Star):
             lines.append("  暂无插件级 Skills")
 
         lines.append("\n当前工作区 Skills (仅当前会话生效，不可全局加载):\n")
-        if workspace_skills:
+        if ws_error:
+            lines.append(f"  [查询失败] {ws_error}")
+        elif workspace_skills:
             ws_status = (
                 "[当前会话生效]"
                 if runtime == "local"
@@ -404,15 +454,14 @@ class Main(star.Star):
             return
         mgr = SkillManager()
         try:
-            workspace_skills = await list_session_workspace_skills(
-                mgr, getattr(event, "unified_msg_origin", ""), self.context
-            )
-            if is_workspace_only_skill(mgr, name, workspace_skills):
-                event.set_result(
-                    MessageEventResult().message(
-                        f"[失败] Skill '{name}' 是当前会话工作区 Skill（仅在当前会话 local 运行时按请求加载，不能全局加载），不支持全局启用或禁用"
-                    )
-                )
+            if ws_conflict := await check_workspace_only_conflict(
+                mgr,
+                name,
+                getattr(event, "unified_msg_origin", ""),
+                self.context,
+                "（仅在当前会话 local 运行时按请求加载，不能全局加载），不支持全局启用或禁用",
+            ):
+                event.set_result(MessageEventResult().message(f"[失败] {ws_conflict}"))
                 return
             mgr.set_skill_active(name, True)
             event.set_result(
@@ -444,15 +493,14 @@ class Main(star.Star):
             return
         mgr = SkillManager()
         try:
-            workspace_skills = await list_session_workspace_skills(
-                mgr, getattr(event, "unified_msg_origin", ""), self.context
-            )
-            if is_workspace_only_skill(mgr, name, workspace_skills):
-                event.set_result(
-                    MessageEventResult().message(
-                        f"[失败] Skill '{name}' 是当前会话工作区 Skill（仅在当前会话 local 运行时按请求加载，不能全局加载），不支持全局启用或禁用"
-                    )
-                )
+            if ws_conflict := await check_workspace_only_conflict(
+                mgr,
+                name,
+                getattr(event, "unified_msg_origin", ""),
+                self.context,
+                "（仅在当前会话 local 运行时按请求加载，不能全局加载），不支持全局启用或禁用",
+            ):
+                event.set_result(MessageEventResult().message(f"[失败] {ws_conflict}"))
                 return
             mgr.set_skill_active(name, False)
             event.set_result(
@@ -484,15 +532,14 @@ class Main(star.Star):
             return
         mgr = SkillManager()
         try:
-            workspace_skills = await list_session_workspace_skills(
-                mgr, getattr(event, "unified_msg_origin", ""), self.context
-            )
-            if is_workspace_only_skill(mgr, name, workspace_skills):
-                event.set_result(
-                    MessageEventResult().message(
-                        f"[失败] Skill '{name}' 是当前会话工作区 Skill，不支持通过全局 Skill 管理删除"
-                    )
-                )
+            if ws_conflict := await check_workspace_only_conflict(
+                mgr,
+                name,
+                getattr(event, "unified_msg_origin", ""),
+                self.context,
+                "，不支持通过全局 Skill 管理删除",
+            ):
+                event.set_result(MessageEventResult().message(f"[失败] {ws_conflict}"))
                 return
             mgr.delete_skill(name)
             event.set_result(
@@ -525,7 +572,10 @@ class Main(star.Star):
 
         mgr = SkillManager()
         skill_dir, scope_label = await self._resolve_readable_skill_dir(
-            mgr, name, getattr(event, "unified_msg_origin", "")
+            mgr,
+            name,
+            getattr(event, "unified_msg_origin", ""),
+            runtime=self._detect_runtime(event),
         )
         if skill_dir is None:
             event.set_result(
@@ -566,7 +616,10 @@ class Main(star.Star):
 
         mgr = SkillManager()
         skill_dir, _scope_label = await self._resolve_readable_skill_dir(
-            mgr, name, getattr(event, "unified_msg_origin", "")
+            mgr,
+            name,
+            getattr(event, "unified_msg_origin", ""),
+            runtime=self._detect_runtime(event),
         )
         if skill_dir is None:
             event.set_result(

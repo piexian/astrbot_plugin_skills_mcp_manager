@@ -590,6 +590,7 @@ class AstrBotIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(del_plugin["ok"])
             self.assertIn("插件级 Skill", del_plugin["error"])
             self.assertIn("astrbot_plugin_sample", del_plugin["error"])
+            self.assertTrue((plugin_skill_dir / "SKILL.md").exists())
 
             del_ws = json.loads(
                 await self.tools.DeleteSkillTool().call(
@@ -602,6 +603,7 @@ class AstrBotIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
             await self.plugin.skill_del(event, "p_skill")
             self.assertIn("插件级 Skill", event.sent[-1])
+            self.assertTrue((plugin_skill_dir / "SKILL.md").exists())
             await self.plugin.skill_del(event, "ws_only")
             self.assertIn("工作区 Skill", event.sent[-1])
 
@@ -616,3 +618,37 @@ class AstrBotIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 await self.tools.DisableSkillTool().call(ctx, skill_name="p_skill")
             )
             self.assertTrue(off_plugin["ok"])
+            skills_after = {
+                s.name: s.active for s in manager.list_skills(runtime="local")
+            }
+            self.assertFalse(skills_after["p_skill"])
+
+            # 5. Same-named workspace skill overrides plugin (not global) and is preferred by /skill read in local runtime
+            ws_override_dir = Path(ws_root) / "skills" / "p_skill"
+            ws_override_dir.mkdir(parents=True, exist_ok=True)
+            (ws_override_dir / "SKILL.md").write_text(
+                "---\ndescription: Workspace override\n---\nWS_OVERRIDE_BODY",
+                encoding="utf-8",
+            )
+            override_res = json.loads(await self.tools.ListSkillsTool().call(ctx))
+            ws_override = {
+                s["name"]: s for s in override_res["data"]["workspace_skills"]
+            }["p_skill"]
+            self.assertFalse(ws_override["overrides_global"])
+            self.assertTrue(ws_override["overrides_plugin"])
+
+            await self.plugin.skill_read(event, "p_skill", "SKILL.md")
+            self.assertIn("WS_OVERRIDE_BODY", event.sent[-1])
+
+            # 6. Plugin skill symlink escaping plugins_root is rejected by _resolve_readable_skill_dir
+            outside_dir = self.root / "outside_secret"
+            outside_dir.mkdir(parents=True, exist_ok=True)
+            (outside_dir / "SKILL.md").write_text("SECRET", encoding="utf-8")
+            escaped_link = (
+                plugins_root / "astrbot_plugin_sample" / "skills" / "escaped_skill"
+            )
+            escaped_link.symlink_to(outside_dir, target_is_directory=True)
+            resolved_dir, _ = await self.plugin._resolve_readable_skill_dir(
+                manager, "escaped_skill", umo, runtime="local"
+            )
+            self.assertIsNone(resolved_dir)
