@@ -451,12 +451,28 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         moved_admin_sddl = (
             "O:BAD:AI(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)(A;OICIID;FA;;;OW)"
         )
-        normal_sddl = "O:BAD:AI(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)(A;OICIID;FA;;;S-1-5-21-1001-1002-1003-1004)"
+        sid_admin_owner_sddl = "O:S-1-5-32-544D:AI(A;OICIID;FA;;;SY)(A;OICIID;FA;;;OW)"
+        deny_user_sddl = "O:BAD:AI(D;OICIID;FA;;;BU)(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)(A;OICIID;FA;;;BU)"
+        write_only_user_sddl = (
+            "O:BAD:AI(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)(A;OICIID;FW;;;BU)"
+        )
+        normal_sddl = (
+            "O:S-1-5-21-1001-1002-1003-1004G:SY"
+            "D:AI(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)(A;OICIID;FA;;;BU)"
+        )
         self.assertIsNotNone(scanner._check_windows_sddl(protected_sddl, parent_sddl))
         self.assertIsNotNone(scanner._check_windows_sddl(moved_admin_sddl, parent_sddl))
+        self.assertIsNotNone(
+            scanner._check_windows_sddl(sid_admin_owner_sddl, parent_sddl)
+        )
+        self.assertIsNotNone(scanner._check_windows_sddl(deny_user_sddl, parent_sddl))
+        self.assertIsNotNone(
+            scanner._check_windows_sddl(write_only_user_sddl, parent_sddl)
+        )
         self.assertIsNone(scanner._check_windows_sddl(normal_sddl, parent_sddl))
 
     async def test_legacy_installed_skill_permission_risk_warns_without_blocking(self):
+        self.skills.chmod(0o755)
         legacy = self.skills / "answer-me-with-html"
         legacy.mkdir(mode=0o700)
         (legacy / "SKILL.md").write_text("Legacy skill")
@@ -464,8 +480,9 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         plugins_dir = self.root / "plugins"
         bad_plugin_skills = plugins_dir / "old_plugin" / "skills"
         bad_plugin_skills.mkdir(parents=True)
+        plugins_dir.chmod(0o755)
+        (plugins_dir / "old_plugin").chmod(0o755)
         bad_plugin_skills.chmod(0o700)
-        self.manager.plugins_root = plugins_dir
 
         source = self.archive({"demo/SKILL.md": "Normal skill"})
         result, pending = await self.installer.prepare(self.manager, source)
@@ -512,30 +529,38 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_install_and_update_normalize_permissions_without_mkdtemp(self):
+        self.skills.chmod(0o755)
         target = self.installed()
         target.chmod(0o700)
         (target / "SKILL.md").chmod(0o600)
         source = self.archive({"demo/SKILL.md": "Updated", "demo/sub/info.txt": "ok"})
-        with patch.object(
-            tempfile,
-            "mkdtemp",
-            side_effect=AssertionError("mkdtemp (0o700) must not be used"),
-        ):
-            result = await self.installer.run(
-                self.manager, source, operation="replace", skill_name="demo"
-            )
+        old_umask = service.os.umask(0o077)
+        try:
+            with patch.object(
+                tempfile,
+                "mkdtemp",
+                side_effect=AssertionError("mkdtemp (0o700) must not be used"),
+            ):
+                result = await self.installer.run(
+                    self.manager, source, operation="replace", skill_name="demo"
+                )
+        finally:
+            service.os.umask(old_umask)
         self.assertTrue(result["ok"])
-        self.assertEqual((target.stat().st_mode & 0o755), 0o755)
-        self.assertEqual(((target / "sub").stat().st_mode & 0o755), 0o755)
-        self.assertEqual(((target / "SKILL.md").stat().st_mode & 0o644), 0o644)
+        self.assertEqual((target.stat().st_mode & 0o777), 0o755)
+        self.assertEqual(((target / "sub").stat().st_mode & 0o777), 0o755)
+        self.assertEqual(((target / "SKILL.md").stat().st_mode & 0o777), 0o644)
         self.assertIsNone(scanner.inspect_skill_permission_issue(target, self.skills))
+
+        # Private skills_root (0o750) preserves private scope instead of broadening to world-readable
+        self.skills.chmod(0o750)
 
         def install_with_0700(zip_path, *, overwrite=True):
             installed_dir = self.skills / "new_skill"
             installed_dir.mkdir(mode=0o700)
-            installed_dir.chmod(0o700)
+            installed_dir.chmod(0o777)
             (installed_dir / "SKILL.md").write_text("New")
-            (installed_dir / "SKILL.md").chmod(0o600)
+            (installed_dir / "SKILL.md").chmod(0o666)
             return "new_skill"
 
         self.manager.install_skill_from_zip = install_with_0700
@@ -544,6 +569,6 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(install_res["ok"])
         new_dir = self.skills / "new_skill"
-        self.assertEqual((new_dir.stat().st_mode & 0o755), 0o755)
-        self.assertEqual(((new_dir / "SKILL.md").stat().st_mode & 0o644), 0o644)
+        self.assertEqual((new_dir.stat().st_mode & 0o777), 0o750)
+        self.assertEqual(((new_dir / "SKILL.md").stat().st_mode & 0o777), 0o640)
         self.assertIsNone(scanner.inspect_skill_permission_issue(new_dir, self.skills))

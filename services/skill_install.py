@@ -100,34 +100,39 @@ def _reset_windows_acl(target: Path) -> None:
     if os.name != "nt":
         return
     try:
-        subprocess.run(
+        completed = subprocess.run(
             ["icacls", str(target), "/reset", "/t", "/c", "/q"],
             check=False,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=15,
         )
-    except (OSError, subprocess.SubprocessError):
-        logger.debug("Could not run icacls reset on %s", target, exc_info=True)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise OSError("无法重置 Windows ACL 继承权限。") from exc
+    if completed.returncode != 0:
+        raise OSError("重置 Windows ACL 继承权限失败。")
 
 
 def _normalize_permissions(target: Path, root: Path) -> None:
     if not target.exists():
         return
     if os.name == "nt":
-        if target.is_dir() and inspect_skill_permission_issue(target, root):
-            _reset_windows_acl(target)
+        _reset_windows_acl(target)
         pending = [target]
         while pending:
             current = pending.pop()
-            try:
-                os.chmod(current, stat.S_IREAD | stat.S_IWRITE)
-                if current.is_dir() and not current.is_symlink():
-                    with os.scandir(current) as children:
-                        for entry in children:
-                            pending.append(Path(entry.path))
-            except OSError:
+            info = current.lstat()
+            if stat.S_ISLNK(info.st_mode):
                 continue
+            os.chmod(current, stat.S_IREAD | stat.S_IWRITE)
+            if stat.S_ISDIR(info.st_mode):
+                with os.scandir(current) as children:
+                    for entry in children:
+                        pending.append(Path(entry.path))
+        if target.is_dir():
+            issue = inspect_skill_permission_issue(target, root)
+            if issue:
+                raise OSError(f"Windows 权限归一化后仍存在异常: {issue}")
         return
 
     try:
@@ -142,33 +147,31 @@ def _normalize_permissions(target: Path, root: Path) -> None:
         root_mode = 0o755
         chown_ids = None
 
-    dir_bits = (root_mode & 0o777) | 0o755
-    file_bits = (dir_bits & 0o666) | 0o644
-    exec_bits = (dir_bits & 0o111) | 0o111
+    dir_bits = (root_mode & 0o777) | 0o700
+    file_bits = (dir_bits & 0o666) | 0o600
+    exec_bits = file_bits | (dir_bits & 0o111) | 0o100
 
     pending = [target]
     while pending:
         current = pending.pop()
-        try:
-            info = current.lstat()
-        except OSError:
-            continue
+        info = current.lstat()
         if stat.S_ISLNK(info.st_mode):
             continue
         cur_mode = stat.S_IMODE(info.st_mode)
-        try:
-            if stat.S_ISDIR(info.st_mode):
-                os.chmod(current, (cur_mode | dir_bits) & 0o777)
-                with os.scandir(current) as children:
-                    for entry in children:
-                        pending.append(Path(entry.path))
-            elif stat.S_ISREG(info.st_mode):
-                extra_exec = exec_bits if (cur_mode & 0o111) else 0
-                os.chmod(current, (cur_mode | file_bits | extra_exec) & 0o777)
-            if chown_ids is not None:
-                os.chown(current, *chown_ids)
-        except OSError:
-            continue
+        if not os.path.samestat(info, current.lstat()):
+            raise OSError("权限归一化期间目标发生并发变更。")
+        if stat.S_ISDIR(info.st_mode):
+            os.chmod(current, dir_bits)
+            with os.scandir(current) as children:
+                for entry in children:
+                    pending.append(Path(entry.path))
+        elif stat.S_ISREG(info.st_mode):
+            os.chmod(current, exec_bits if (cur_mode & 0o111) else file_bits)
+        if chown_ids is not None:
+            try:
+                os.chown(current, *chown_ids, follow_symlinks=False)
+            except PermissionError:
+                logger.debug("Could not chown %s", current, exc_info=True)
 
 
 def _replace_tree(files: dict[str, bytes], target: Path) -> None:
@@ -182,14 +185,16 @@ def _replace_tree(files: dict[str, bytes], target: Path) -> None:
         target.rename(backup)
         try:
             staged.rename(target)
+            _normalize_permissions(target, target.parent)
         except Exception:
             try:
+                if target.exists():
+                    shutil.rmtree(target)
                 backup.rename(target)
             except Exception:
                 preserve_backup = True
                 logger.exception("Skill rollback failed; backup retained at %s", backup)
             raise
-        _normalize_permissions(target, target.parent)
     finally:
         if not preserve_backup:
             try:
@@ -328,11 +333,17 @@ class SkillInstallService:
                 files = load_zip(Path(source))
 
             scan_files(files, report)
-            plugins_root = getattr(manager, "plugins_root", None)
+            raw_plugins_root = getattr(manager, "plugins_root", None)
+            if raw_plugins_root:
+                resolved_plugins_root: Path | None = Path(raw_plugins_root).resolve()
+            elif (root.parent / "plugins").exists():
+                resolved_plugins_root = (root.parent / "plugins").resolve()
+            else:
+                resolved_plugins_root = None
             legacy_warnings = audit_installed_skills(
                 root,
                 report,
-                plugins_root=Path(plugins_root).resolve() if plugins_root else None,
+                plugins_root=resolved_plugins_root,
             )
             if legacy_warnings:
                 result["legacy_permission_warnings"] = legacy_warnings
