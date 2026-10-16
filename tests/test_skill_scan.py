@@ -444,3 +444,242 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         result, pending = await installer.prepare(self.manager, source)
         self.assertIsNone(pending)
         self.assertEqual(result["scan"]["decision"], "block")
+
+    def test_windows_sddl_permission_scope_detection(self):
+        parent_sddl = "O:BAD:AI(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)(A;OICIID;FA;;;BU)"
+        protected_sddl = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;OW)"
+        moved_admin_sddl = (
+            "O:BAD:AI(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)(A;OICIID;FA;;;OW)"
+        )
+        sid_admin_owner_sddl = "O:S-1-5-32-544D:AI(A;OICIID;FA;;;SY)(A;OICIID;FA;;;OW)"
+        deny_user_sddl = "O:BAD:AI(D;OICIID;FA;;;BU)(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)(A;OICIID;FA;;;BU)"
+        deny_traverse_sddl = "O:BAD:AI(D;OICIID;FX;;;BU)(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)(A;OICIID;FA;;;BU)"
+        ds_ccsw_deny_sddl = "O:BAD:AI(D;OICIID;CCSW;;;BU)(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)(A;OICIID;FA;;;BU)"
+        write_only_user_sddl = (
+            "O:BAD:AI(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)(A;OICIID;FW;;;BU)"
+        )
+        ccrp_only_sddl = (
+            "O:BAD:AI(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)(A;OICIID;CCRP;;;BU)"
+        )
+        inherit_only_allow_sddl = (
+            "O:BAD:AI(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)(A;OICIIOID;FR;;;BU)"
+        )
+        inherit_only_deny_dir_sddl = "O:BAD:AI(D;OICIIO;FA;;;BU)(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)(A;OICIID;FA;;;BU)"
+        sym_file_read_sddl = "O:BAD:AI(A;ID;FA;;;SY)(A;ID;FA;;;BA)(A;ID;FR;;;BU)"
+        hex_file_read_sddl = (
+            "O:BAD:AI(A;ID;FA;;;SY)(A;ID;FA;;;BA)(A;ID;0x00120089;;;BU)"
+        )
+        sym_dir_read_exec_sddl = (
+            "O:BAD:AI(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)(A;OICIID;FRFX;;;BU)"
+        )
+        hex_dir_read_exec_sddl = (
+            "O:BAD:AI(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)(A;OICIID;0x001200a9;;;BU)"
+        )
+        normal_sddl = (
+            "O:S-1-5-21-1001-1002-1003-1004G:SY"
+            "D:AI(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)(A;OICIID;FA;;;BU)"
+        )
+        self.assertIsNotNone(scanner._check_windows_sddl(protected_sddl, parent_sddl))
+        self.assertIsNotNone(scanner._check_windows_sddl(moved_admin_sddl, parent_sddl))
+        self.assertIsNotNone(
+            scanner._check_windows_sddl(sid_admin_owner_sddl, parent_sddl)
+        )
+        self.assertIsNotNone(scanner._check_windows_sddl(deny_user_sddl, parent_sddl))
+        self.assertIsNotNone(
+            scanner._check_windows_sddl(deny_traverse_sddl, parent_sddl, is_dir=True)
+        )
+        self.assertIsNone(
+            scanner._check_windows_sddl(deny_traverse_sddl, parent_sddl, is_dir=False)
+        )
+        self.assertIsNone(scanner._check_windows_sddl(ds_ccsw_deny_sddl, parent_sddl))
+        self.assertIsNotNone(
+            scanner._check_windows_sddl(write_only_user_sddl, parent_sddl)
+        )
+        self.assertIsNotNone(scanner._check_windows_sddl(ccrp_only_sddl, parent_sddl))
+        self.assertIsNotNone(
+            scanner._check_windows_sddl(inherit_only_allow_sddl, parent_sddl)
+        )
+        # INHERIT_ONLY_ACE (IO) does not control access to the attached object itself
+        self.assertIsNone(
+            scanner._check_windows_sddl(
+                inherit_only_deny_dir_sddl, parent_sddl, is_dir=True
+            )
+        )
+        # Symbolic FR and hex 0x00120089 behave identically: invalid for dir (no 0x20), valid for file
+        for file_read_sddl in (sym_file_read_sddl, hex_file_read_sddl):
+            self.assertIsNotNone(
+                scanner._check_windows_sddl(file_read_sddl, parent_sddl, is_dir=True)
+            )
+            self.assertIsNone(
+                scanner._check_windows_sddl(file_read_sddl, parent_sddl, is_dir=False)
+            )
+        for dir_rx_sddl in (sym_dir_read_exec_sddl, hex_dir_read_exec_sddl):
+            self.assertIsNone(
+                scanner._check_windows_sddl(dir_rx_sddl, parent_sddl, is_dir=True)
+            )
+        self.assertIsNone(scanner._check_windows_sddl(normal_sddl, parent_sddl))
+
+    async def test_legacy_installed_skill_permission_risk_warns_without_blocking(self):
+        self.skills.chmod(0o755)
+        legacy = self.skills / "answer-me-with-html"
+        legacy.mkdir(mode=0o700)
+        (legacy / "SKILL.md").write_text("Legacy skill")
+        legacy.chmod(0o700)
+        plugins_dir = self.root / "plugins"
+        bad_plugin_skills = plugins_dir / "old_plugin" / "skills"
+        bad_plugin_skills.mkdir(parents=True)
+        plugins_dir.chmod(0o755)
+        (plugins_dir / "old_plugin").chmod(0o755)
+        bad_plugin_skills.chmod(0o700)
+
+        source = self.archive({"demo/SKILL.md": "Normal skill"})
+        result, pending = await self.installer.prepare(self.manager, source)
+        self.assertTrue(result["ok"])
+        self.assertIsNotNone(pending)
+        self.assertEqual(result["operation_status"], "awaiting_confirmation")
+        self.assertEqual(result["scan"]["status"], "complete")
+        self.assertEqual(result["scan"]["decision"], "warn")
+        warned_files = {
+            f["file"]
+            for f in result["scan"]["findings"]
+            if f["rule"] == "legacy_skill_permission_risk"
+            and f["severity"] == "warning"
+        }
+        self.assertEqual(warned_files, {"answer-me-with-html", "plugins/old_plugin"})
+        self.assertEqual(
+            {w["name"] for w in result["legacy_permission_warnings"]},
+            {"answer-me-with-html", "old_plugin"},
+        )
+
+    async def test_unreadable_legacy_skill_warns_without_crashing_or_blocking(self):
+        legacy = self.skills / "locked-skill"
+        legacy.mkdir()
+        (legacy / "SKILL.md").write_text("Locked")
+        real_scandir = service.os.scandir
+
+        def guarded_scandir(path):
+            if Path(path) == legacy:
+                raise PermissionError(5, "拒绝访问", str(path))
+            return real_scandir(path)
+
+        source = self.archive({"demo/SKILL.md": "Normal skill"})
+        with patch.object(scanner.os, "scandir", side_effect=guarded_scandir):
+            result, pending = await self.installer.prepare(self.manager, source)
+        self.assertTrue(result["ok"])
+        self.assertIsNotNone(pending)
+        self.assertEqual(result["scan"]["decision"], "warn")
+        self.assertTrue(
+            any(
+                f["rule"] == "legacy_skill_permission_risk"
+                and f["file"] == "locked-skill"
+                for f in result["scan"]["findings"]
+            )
+        )
+
+    async def test_install_and_update_normalize_permissions_without_mkdtemp(self):
+        self.skills.chmod(0o755)
+        target = self.installed()
+        target.chmod(0o700)
+        (target / "SKILL.md").chmod(0o600)
+        source = self.archive({"demo/SKILL.md": "Updated", "demo/sub/info.txt": "ok"})
+        old_umask = service.os.umask(0o077)
+        try:
+            with patch.object(
+                tempfile,
+                "mkdtemp",
+                side_effect=AssertionError("mkdtemp (0o700) must not be used"),
+            ):
+                result = await self.installer.run(
+                    self.manager, source, operation="replace", skill_name="demo"
+                )
+        finally:
+            service.os.umask(old_umask)
+        self.assertTrue(result["ok"])
+        self.assertEqual((target.stat().st_mode & 0o777), 0o755)
+        self.assertEqual(((target / "sub").stat().st_mode & 0o777), 0o755)
+        self.assertEqual(((target / "SKILL.md").stat().st_mode & 0o777), 0o644)
+        self.assertIsNone(scanner.inspect_skill_permission_issue(target, self.skills))
+
+        # Private skills_root (0o750) preserves private scope instead of broadening to world-readable
+        self.skills.chmod(0o750)
+
+        def install_with_0700(zip_path, *, overwrite=True):
+            installed_dir = self.skills / "new_skill"
+            installed_dir.mkdir(mode=0o700)
+            installed_dir.chmod(0o777)
+            (installed_dir / "SKILL.md").write_text("New")
+            (installed_dir / "SKILL.md").chmod(0o666)
+            return "new_skill"
+
+        self.manager.install_skill_from_zip = install_with_0700
+        install_res = await self.installer.run(
+            self.manager, self.archive({"new_skill/SKILL.md": "New"})
+        )
+        self.assertTrue(install_res["ok"])
+        new_dir = self.skills / "new_skill"
+        self.assertEqual((new_dir.stat().st_mode & 0o777), 0o750)
+        self.assertEqual(((new_dir / "SKILL.md").stat().st_mode & 0o777), 0o640)
+        self.assertIsNone(scanner.inspect_skill_permission_issue(new_dir, self.skills))
+
+    async def test_single_file_update_rolls_back_when_normalization_fails(self):
+        target = self.installed()
+        replacement = self.root / "SKILL.md"
+        replacement.write_text("Updated skill")
+        prepared, pending = await self.installer.prepare(
+            self.manager,
+            str(replacement),
+            operation="file",
+            skill_name="demo",
+            file_name="SKILL.md",
+        )
+        self.assertTrue(prepared["ok"])
+        self.assertIsNotNone(pending)
+
+        calls = 0
+        real_normalize = service._normalize_permissions
+
+        def fail_on_tree_normalize(path: Path, root: Path) -> None:
+            nonlocal calls
+            calls += 1
+            if calls >= 2:
+                raise PermissionError("sibling file chmod failed")
+            real_normalize(path, root)
+
+        with (
+            patch.object(
+                service, "_normalize_permissions", side_effect=fail_on_tree_normalize
+            ),
+            self.assertLogs(service.logger, level="ERROR"),
+        ):
+            result = await self.installer.commit(pending)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["operation_status"], "failed")
+        self.assertEqual((target / "SKILL.md").read_text(), "Original skill")
+
+    def test_normalize_permissions_repairs_unreadable_0000_and_write_only_entries(self):
+        self.skills.chmod(0o755)
+        target = self.skills / "broken"
+        sub = target / "sub"
+        sub.mkdir(parents=True)
+        zero_file = target / "SKILL.md"
+        zero_file.write_text("Skill")
+        write_only = sub / "note.txt"
+        write_only.write_text("Note")
+        exec_script = target / "run.sh"
+        exec_script.write_text("echo ok")
+        exec_script.chmod(0o100)
+        zero_file.chmod(0o000)
+        write_only.chmod(0o200)
+        sub.chmod(0o000)
+        target.chmod(0o000)
+        try:
+            service._normalize_permissions(target, self.skills)
+            self.assertEqual((target.stat().st_mode & 0o777), 0o755)
+            self.assertEqual((sub.stat().st_mode & 0o777), 0o755)
+            self.assertEqual((zero_file.stat().st_mode & 0o777), 0o644)
+            self.assertEqual((write_only.stat().st_mode & 0o777), 0o644)
+            self.assertEqual((exec_script.stat().st_mode & 0o777), 0o755)
+        finally:
+            for item in (target, sub, zero_file, write_only, exec_script):
+                if item.exists():
+                    item.chmod(0o755)

@@ -592,3 +592,443 @@ def scan_files(files: dict[str, bytes], report: ScanReport) -> ScanReport:
         report.incomplete(exc.code, str(exc))
     report.finish()
     return report
+
+
+_ADMIN_ONLY_SIDS = {"SY", "BA", "LA", "S-1-5-18", "S-1-5-32-544"}
+_SDDL_RIGHT_MASKS = {
+    "GA": 0x001F01FF,
+    "FA": 0x001F01FF,
+    "GR": 0x00120089,
+    "FR": 0x00120089,
+    "GX": 0x001200A0,
+    "FX": 0x001200A0,
+    "GW": 0x00120116,
+    "FW": 0x00120116,
+}
+
+
+def _parse_ace_flags(flags: str) -> set[str]:
+    cleaned = flags.strip().upper()
+    return {
+        cleaned[i : i + 2]
+        for i in range(0, len(cleaned), 2)
+        if len(cleaned[i : i + 2]) == 2
+    }
+
+
+def _rights_to_access_mask(rights: str) -> int:
+    cleaned = rights.strip()
+    hex_match = re.fullmatch(r"0x[0-9a-fA-F]+", cleaned)
+    if hex_match:
+        mask = int(cleaned, 16)
+        if mask & 0x10000000:
+            mask |= 0x001F01FF
+        if mask & 0x80000000:
+            mask |= 0x00120089
+        if mask & 0x20000000:
+            mask |= 0x001200A0
+        if mask & 0x40000000:
+            mask |= 0x00120116
+        return mask
+    upper = cleaned.upper()
+    mask = 0
+    for idx in range(0, len(upper), 2):
+        token = upper[idx : idx + 2]
+        if len(token) == 2:
+            mask |= _SDDL_RIGHT_MASKS.get(token, 0)
+    return mask
+
+
+def _get_windows_sddl(path: Path) -> str | None:
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        advapi32 = ctypes.windll.advapi32
+        kernel32 = ctypes.windll.kernel32
+        info = 0x00000001 | 0x00000004  # OWNER | DACL
+        sd = wintypes.LPVOID()
+        rc = advapi32.GetNamedSecurityInfoW(
+            wintypes.LPCWSTR(str(path)),
+            1,  # SE_FILE_OBJECT
+            info,
+            None,
+            None,
+            None,
+            None,
+            ctypes.byref(sd),
+        )
+        if rc != 0 or not sd.value:
+            return None
+        try:
+            buf = wintypes.LPWSTR()
+            if not advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                sd, 1, info, ctypes.byref(buf), None
+            ):
+                return None
+            try:
+                return buf.value
+            finally:
+                kernel32.LocalFree(buf)
+        finally:
+            kernel32.LocalFree(sd)
+    except (OSError, AttributeError, ValueError):
+        return None
+
+
+def _sddl_components(
+    sddl: str | None,
+    *,
+    is_dir: bool = True,
+) -> tuple[str, str, set[str], set[str]]:
+    if not sddl:
+        return "", "", set(), set()
+    owner_match = re.search(r"O:(.*?)(?=(?:[GDS]:|\(|$))", sddl)
+    owner = owner_match.group(1).strip() if owner_match else ""
+    dacl_match = re.search(r"D:([A-Z]*)", sddl)
+    dacl_flags = dacl_match.group(1) if dacl_match else ""
+    allow_masks: dict[str, int] = {}
+    deny_masks: dict[str, int] = {}
+    for ace_type, raw_flags, rights, raw_trustee in re.findall(
+        r"\(([AD]);([^;]*);([^;]*);[^;]*;[^;]*;([^)]+)\)", sddl
+    ):
+        if "IO" in _parse_ace_flags(raw_flags):
+            continue
+        mask = _rights_to_access_mask(rights)
+        if mask == 0:
+            continue
+        trustee = raw_trustee.strip()
+        resolved = owner if trustee in {"OW", "S-1-3-4"} and owner else trustee
+        if ace_type == "D":
+            deny_masks[resolved] = deny_masks.get(resolved, 0) | mask
+        else:
+            allow_masks[resolved] = allow_masks.get(resolved, 0) | mask
+    required_mask = (0x1 | 0x20) if is_dir else 0x1
+    deny_trustees = {
+        trustee for trustee, mask in deny_masks.items() if (mask & required_mask) != 0
+    }
+    allow_trustees = {
+        trustee
+        for trustee, mask in allow_masks.items()
+        if ((mask & ~deny_masks.get(trustee, 0)) & required_mask) == required_mask
+    }
+    return owner, dacl_flags, allow_trustees, deny_trustees
+
+
+def _check_windows_sddl(
+    path_sddl: str | None,
+    root_sddl: str | None = None,
+    *,
+    is_dir: bool = True,
+) -> str | None:
+    if not path_sddl:
+        return None
+    _, path_flags, path_trustees, path_denied = _sddl_components(
+        path_sddl, is_dir=is_dir
+    )
+    _, root_flags, root_trustees, _ = _sddl_components(root_sddl, is_dir=True)
+    if "P" in path_flags and "P" not in root_flags:
+        return "NTFS ACL 已禁止继承父目录权限"
+    root_non_admin = root_trustees - _ADMIN_ONLY_SIDS
+    if path_denied & (root_non_admin or {"BU", "AU", "WD", "IU"}):
+        return "NTFS ACL 显式拒绝普通用户读取或遍历权限"
+    if not path_trustees:
+        return "NTFS ACL 未授予任何读取或遍历权限"
+    if path_trustees <= _ADMIN_ONLY_SIDS and (not root_trustees or root_non_admin):
+        return "NTFS ACL 仅允许管理员或系统访问，未包含普通用户权限"
+    if root_non_admin and not ((path_trustees - _ADMIN_ONLY_SIDS) & root_non_admin):
+        return "NTFS ACL 缺少父目录授予的普通用户访问权限"
+    return None
+
+
+def inspect_skill_permission_issue(
+    skill_dir: Path,
+    root: Path,
+    *,
+    budget: list[float] | None = None,
+) -> str | None:
+    try:
+        dir_stat = skill_dir.lstat()
+        if stat.S_ISLNK(dir_stat.st_mode):
+            return "目录为符号链接"
+        if not stat.S_ISDIR(dir_stat.st_mode):
+            return None
+    except PermissionError:
+        return "目录无读取或访问权限（PermissionError）"
+    except OSError:
+        return None
+
+    root_sddl = _get_windows_sddl(root) if os.name == "nt" else None
+    if os.name == "nt":
+        win_issue = _check_windows_sddl(
+            _get_windows_sddl(skill_dir), root_sddl, is_dir=True
+        )
+        if win_issue:
+            return win_issue
+        root_uid = 0
+        required_dir_bits = 0
+        required_file_bits = 0
+    else:
+        try:
+            root_stat = root.stat()
+            root_mode = stat.S_IMODE(root_stat.st_mode)
+            root_uid = root_stat.st_uid
+        except OSError:
+            root_mode = 0o755
+            root_uid = 0
+        required_dir_bits = (root_mode & 0o055) | 0o500
+        required_file_bits = (root_mode & 0o044) | 0o400
+
+    state = budget if budget is not None else [0.0, time.monotonic()]
+    pending = [skill_dir]
+    while pending:
+        current = pending.pop()
+        try:
+            current_stat = current.lstat()
+        except PermissionError:
+            return "目录无读取或访问权限（PermissionError）"
+        except OSError:
+            continue
+        if stat.S_ISLNK(current_stat.st_mode):
+            return "目录内包含符号链接"
+        if os.name != "nt":
+            current_mode = stat.S_IMODE(current_stat.st_mode)
+            if (current_mode & required_dir_bits) != required_dir_bits:
+                return f"目录权限为 {oct(current_mode)}，低于父目录的读取或遍历权限范围"
+            if current_stat.st_uid != root_uid and (
+                current_stat.st_uid == 0 or (current_mode & 0o005) != 0o005
+            ):
+                return "目录所有者与父目录不一致且缺少普通用户访问权限"
+            if not os.access(current, os.R_OK | os.X_OK):
+                return "目录缺少当前用户读取或遍历权限"
+        elif current != skill_dir:
+            win_issue = _check_windows_sddl(
+                _get_windows_sddl(current), root_sddl, is_dir=True
+            )
+            if win_issue:
+                return win_issue
+        try:
+            with os.scandir(current) as children:
+                for entry in children:
+                    state[0] += 1
+                    if (
+                        state[0] > MAX_ENTRIES
+                        or time.monotonic() - state[1] > MAX_SCAN_SECONDS
+                    ):
+                        return "目录条目过多或检查超时，无法完整确认权限范围"
+                    entry_path = Path(entry.path)
+                    try:
+                        entry_stat = entry.stat(follow_symlinks=False)
+                    except PermissionError:
+                        return "目录内条目无读取权限（PermissionError）"
+                    except OSError:
+                        continue
+                    if stat.S_ISLNK(entry_stat.st_mode):
+                        return "目录内包含符号链接"
+                    if stat.S_ISDIR(entry_stat.st_mode):
+                        pending.append(entry_path)
+                    elif stat.S_ISREG(entry_stat.st_mode):
+                        if os.name != "nt":
+                            file_mode = stat.S_IMODE(entry_stat.st_mode)
+                            if (file_mode & required_file_bits) != required_file_bits:
+                                return f"文件 {entry.name} 权限为 {oct(file_mode)}，缺少与父目录匹配的读取权限"
+                            if entry_stat.st_uid != root_uid and (
+                                entry_stat.st_uid == 0 or (file_mode & 0o004) != 0o004
+                            ):
+                                return f"文件 {entry.name} 所有者与父目录不一致且缺少读取权限"
+                            if not os.access(entry_path, os.R_OK):
+                                return f"文件 {entry.name} 缺少读取权限"
+                        else:
+                            win_issue = _check_windows_sddl(
+                                _get_windows_sddl(entry_path),
+                                root_sddl,
+                                is_dir=False,
+                            )
+                            if win_issue:
+                                return win_issue
+                            if not os.access(entry_path, os.R_OK):
+                                return f"文件 {entry.name} 缺少读取权限"
+        except PermissionError:
+            return "目录无遍历权限（PermissionError）"
+        except OSError:
+            continue
+    return None
+
+
+def _emit_legacy_warning(
+    report: ScanReport,
+    warnings: list[dict],
+    *,
+    name: str,
+    label: str,
+    issue: str,
+    is_plugin: bool,
+) -> None:
+    warnings.append({"name": name, "path": label, "reason": issue})
+    if len(report.findings) < MAX_FINDINGS:
+        kind = "插件" if is_plugin else "Skill"
+        report.finding(
+            "legacy_skill_permission_risk",
+            "warning",
+            label,
+            1,
+            f"已安装的旧 {kind} '{name}' 存在权限范围异常（{issue}），切换非管理员或普通用户启动时可能导致无法读取并卡死回复链。",
+        )
+
+
+def audit_installed_skills(
+    root: Path,
+    report: ScanReport,
+    *,
+    plugins_root: Path | None = None,
+) -> list[dict]:
+    warnings: list[dict] = []
+    budget = [0.0, time.monotonic()]
+    roots: list[tuple[Path, str, bool]] = [(root, "", False)]
+    if plugins_root is not None:
+        roots.append((plugins_root, "plugins/", True))
+
+    for base_root, prefix, is_plugin_root in roots:
+        try:
+            if not base_root.exists():
+                continue
+            candidates = []
+            with os.scandir(base_root) as it:
+                for item in it:
+                    budget[0] += 1
+                    if (
+                        budget[0] > MAX_ENTRIES
+                        or time.monotonic() - budget[1] > MAX_SCAN_SECONDS
+                    ):
+                        _emit_legacy_warning(
+                            report,
+                            warnings,
+                            name=base_root.name,
+                            label=prefix.rstrip("/") or base_root.name,
+                            issue="已安装目录数量超过上限或检查超时",
+                            is_plugin=is_plugin_root,
+                        )
+                        break
+                    candidates.append(item)
+            candidates.sort(key=lambda item: item.name)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            _emit_legacy_warning(
+                report,
+                warnings,
+                name=base_root.name,
+                label=prefix.rstrip("/") or base_root.name,
+                issue=f"根目录无读取或遍历权限（{exc.__class__.__name__}）",
+                is_plugin=is_plugin_root,
+            )
+            continue
+
+        for entry in candidates:
+            if not valid_skill_name(entry.name):
+                continue
+            entry_path = Path(entry.path)
+            label = f"{prefix}{entry.name}"
+            try:
+                is_symlink = entry.is_symlink()
+                is_dir = True if is_symlink else entry.is_dir(follow_symlinks=False)
+            except PermissionError:
+                is_symlink = False
+                is_dir = True
+            except OSError:
+                continue
+            if not is_dir:
+                continue
+            if is_symlink:
+                _emit_legacy_warning(
+                    report,
+                    warnings,
+                    name=entry.name,
+                    label=label,
+                    issue="目录为符号链接",
+                    is_plugin=is_plugin_root,
+                )
+                continue
+
+            if is_plugin_root:
+                target_dir = entry_path / "skills"
+                try:
+                    entry_stat = entry_path.lstat()
+                    if os.name != "nt":
+                        root_stat = base_root.stat()
+                        req = (stat.S_IMODE(root_stat.st_mode) & 0o055) | 0o500
+                        cur_mode = stat.S_IMODE(entry_stat.st_mode)
+                        owner_bad = entry_stat.st_uid != root_stat.st_uid and (
+                            entry_stat.st_uid == 0 or (cur_mode & 0o005) != 0o005
+                        )
+                        if (
+                            (cur_mode & req) != req
+                            or owner_bad
+                            or not os.access(entry_path, os.R_OK | os.X_OK)
+                        ):
+                            _emit_legacy_warning(
+                                report,
+                                warnings,
+                                name=entry.name,
+                                label=label,
+                                issue="插件目录缺少读取或遍历权限",
+                                is_plugin=True,
+                            )
+                            continue
+                    else:
+                        win_issue = _check_windows_sddl(
+                            _get_windows_sddl(entry_path),
+                            _get_windows_sddl(base_root),
+                        )
+                        if win_issue:
+                            _emit_legacy_warning(
+                                report,
+                                warnings,
+                                name=entry.name,
+                                label=label,
+                                issue=win_issue,
+                                is_plugin=True,
+                            )
+                            continue
+                    target_dir.lstat()
+                except FileNotFoundError:
+                    continue
+                except PermissionError:
+                    _emit_legacy_warning(
+                        report,
+                        warnings,
+                        name=entry.name,
+                        label=label,
+                        issue="插件目录或 skills 子目录无访问权限（PermissionError）",
+                        is_plugin=True,
+                    )
+                    continue
+                except OSError as exc:
+                    _emit_legacy_warning(
+                        report,
+                        warnings,
+                        name=entry.name,
+                        label=label,
+                        issue=f"插件目录或 skills 子目录访问异常（{exc.__class__.__name__}）",
+                        is_plugin=True,
+                    )
+                    continue
+            else:
+                target_dir = entry_path
+
+            issue = inspect_skill_permission_issue(target_dir, base_root, budget=budget)
+            if issue:
+                _emit_legacy_warning(
+                    report,
+                    warnings,
+                    name=entry.name,
+                    label=label,
+                    issue=issue,
+                    is_plugin=is_plugin_root,
+                )
+
+    if warnings and report.status == "complete":
+        report.finish()
+    return warnings

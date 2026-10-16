@@ -7,7 +7,10 @@ import logging
 import os
 import re
 import shutil
+import stat
+import subprocess
 import tempfile
+import uuid
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,6 +22,10 @@ from ..security.scanner import (
     MAX_TOTAL_BYTES,
     InspectionError,
     ScanReport,
+    _check_windows_sddl,
+    _get_windows_sddl,
+    audit_installed_skills,
+    inspect_skill_permission_issue,
     load_directory,
     load_zip,
     member_path,
@@ -77,18 +84,152 @@ def _write_tree(files: dict[str, bytes], destination: Path) -> None:
         path.write_bytes(data)
 
 
+def _make_staging_dir(base: Path, prefix: str = "skill_update_") -> Path:
+    base.mkdir(parents=True, exist_ok=True)
+    for _ in range(32):
+        candidate = base / f"{prefix}{uuid.uuid4().hex[:12]}"
+        try:
+            # Avoid mode 0o700 (used by tempfile.mkdtemp): on Windows Python 3.12.4+/3.13+,
+            # mode 0o700 applies a protected Admin-only DACL (D:P) that disables inheritance.
+            os.mkdir(candidate, 0o755)
+            return candidate
+        except FileExistsError:
+            continue
+    raise OSError("无法创建临时交换目录。")
+
+
+def _reset_windows_acl(target: Path) -> None:
+    if os.name != "nt":
+        return
+    try:
+        completed = subprocess.run(
+            ["icacls", str(target), "/reset", "/t", "/c", "/q"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise OSError("无法重置 Windows ACL 继承权限。") from exc
+    if completed.returncode != 0:
+        raise OSError("重置 Windows ACL 继承权限失败。")
+
+
+def _normalize_permissions(target: Path, root: Path) -> None:
+    if not target.exists():
+        return
+    if os.name == "nt":
+        _reset_windows_acl(target)
+        pending = [target]
+        while pending:
+            current = pending.pop()
+            info = current.lstat()
+            if stat.S_ISLNK(info.st_mode):
+                continue
+            os.chmod(current, stat.S_IREAD | stat.S_IWRITE)
+            if stat.S_ISDIR(info.st_mode):
+                with os.scandir(current) as children:
+                    for entry in children:
+                        pending.append(Path(entry.path))
+        if target.is_dir():
+            issue = inspect_skill_permission_issue(target, root)
+            if issue:
+                raise OSError(f"Windows 权限归一化后仍存在异常: {issue}")
+        else:
+            file_issue = _check_windows_sddl(
+                _get_windows_sddl(target), _get_windows_sddl(root), is_dir=False
+            )
+            if file_issue or not os.access(target, os.R_OK):
+                raise OSError(
+                    f"Windows 文件权限归一化后仍存在异常: {file_issue or '缺少读取权限'}"
+                )
+        return
+
+    try:
+        root_stat = root.stat()
+        root_mode = stat.S_IMODE(root_stat.st_mode)
+        chown_ids = (
+            (root_stat.st_uid, root_stat.st_gid)
+            if hasattr(os, "geteuid") and os.geteuid() == 0 and root_stat.st_uid != 0
+            else None
+        )
+    except OSError:
+        root_mode = 0o755
+        chown_ids = None
+
+    dir_bits = (root_mode & 0o777) | 0o700
+    file_bits = (dir_bits & 0o666) | 0o600
+    exec_bits = file_bits | (dir_bits & 0o111) | 0o100
+    o_path = getattr(os, "O_PATH", 0)
+    o_nofollow = getattr(os, "O_NOFOLLOW", 0)
+    use_proc_fd = o_path != 0 and Path("/proc/self/fd").is_dir()
+    chmod_nofollow = os.chmod in getattr(os, "supports_follow_symlinks", set())
+
+    pending = [target]
+    while pending:
+        current = pending.pop()
+        info = current.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            continue
+        is_dir = stat.S_ISDIR(info.st_mode)
+        is_reg = stat.S_ISREG(info.st_mode)
+        if not (is_dir or is_reg):
+            continue
+        cur_mode = stat.S_IMODE(info.st_mode)
+        desired_mode = (
+            dir_bits if is_dir else (exec_bits if (cur_mode & 0o111) else file_bits)
+        )
+        if use_proc_fd:
+            fd = os.open(current, o_path | o_nofollow)
+            try:
+                fd_info = os.fstat(fd)
+                if not os.path.samestat(info, fd_info):
+                    raise OSError("权限归一化期间目标发生并发变更。")
+                proc_fd_path = f"/proc/self/fd/{fd}"
+                os.chmod(proc_fd_path, desired_mode)
+                if chown_ids is not None:
+                    try:
+                        os.chown(proc_fd_path, *chown_ids)
+                    except PermissionError:
+                        logger.debug("Could not chown %s", current, exc_info=True)
+            finally:
+                os.close(fd)
+        else:
+            if not os.path.samestat(info, current.lstat()):
+                raise OSError("权限归一化期间目标发生并发变更。")
+            if chmod_nofollow:
+                os.chmod(current, desired_mode, follow_symlinks=False)
+            else:
+                os.chmod(current, desired_mode)
+            if not os.path.samestat(info, current.lstat()):
+                raise OSError("权限归一化期间目标发生并发变更。")
+            if chown_ids is not None:
+                try:
+                    os.chown(current, *chown_ids, follow_symlinks=False)
+                except PermissionError:
+                    logger.debug("Could not chown %s", current, exc_info=True)
+        if is_dir:
+            with os.scandir(current) as children:
+                for entry in children:
+                    pending.append(Path(entry.path))
+
+
 def _replace_tree(files: dict[str, bytes], target: Path) -> None:
     # Stage beside skills_root, never inside it: partially built skills must not be discoverable.
-    tmp = Path(tempfile.mkdtemp(prefix="skill_update_", dir=target.parent.parent))
+    tmp = _make_staging_dir(target.parent.parent)
     staged, backup = tmp / "new", tmp / "backup"
     preserve_backup = False
     try:
         _write_tree(files, staged)
+        _normalize_permissions(staged, target.parent)
         target.rename(backup)
         try:
             staged.rename(target)
+            _normalize_permissions(target, target.parent)
         except Exception:
             try:
+                if target.exists():
+                    shutil.rmtree(target)
                 backup.rename(target)
             except Exception:
                 preserve_backup = True
@@ -102,19 +243,39 @@ def _replace_tree(files: dict[str, bytes], target: Path) -> None:
                 logger.warning("Could not clean skill staging directory %s", tmp)
 
 
-def _replace_file(content: bytes, target: Path) -> None:
+def _write_atomic_file(content: bytes, target: Path, mode: int | None = None) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as stream:
         temporary = Path(stream.name)
         try:
             stream.write(content)
             stream.flush()
-            if target.exists():
-                temporary.chmod(target.stat().st_mode & 0o777)
+            if mode is not None:
+                temporary.chmod(mode & 0o777)
+            elif target.exists():
+                temporary.chmod(target.lstat().st_mode & 0o777)
             stream.close()
             os.replace(temporary, target)
         finally:
             temporary.unlink(missing_ok=True)
+
+
+def _replace_file(content: bytes, target: Path) -> None:
+    existed = target.exists()
+    old_bytes = target.read_bytes() if existed else None
+    old_mode = stat.S_IMODE(target.lstat().st_mode) if existed else None
+    _write_atomic_file(content, target, old_mode)
+    try:
+        _normalize_permissions(target, target.parent)
+    except Exception:
+        try:
+            if old_bytes is not None:
+                _write_atomic_file(old_bytes, target, old_mode)
+            else:
+                target.unlink(missing_ok=True)
+        except OSError:
+            logger.exception("Failed to roll back %s", target)
+        raise
 
 
 class SkillInstallService:
@@ -231,11 +392,24 @@ class SkillInstallService:
                 files = load_zip(Path(source))
 
             scan_files(files, report)
+            raw_plugins_root = getattr(manager, "plugins_root", None)
+            if raw_plugins_root:
+                resolved_plugins_root: Path | None = Path(raw_plugins_root).resolve()
+            elif (root.parent / "plugins").exists():
+                resolved_plugins_root = (root.parent / "plugins").resolve()
+            else:
+                resolved_plugins_root = None
+            legacy_warnings = audit_installed_skills(
+                root,
+                report,
+                plugins_root=resolved_plugins_root,
+            )
+            if legacy_warnings:
+                result["legacy_permission_warnings"] = legacy_warnings
             # Force can override content analysis, never unsafe paths or unbounded ingestion.
             if report.decision == "block" and not force:
                 result["error"] = "扫描未通过，未安装或更新 Skill。"
                 return result | {"scan": report.to_dict()}, None
-
             targets = []
             if operation == "install":
                 root_mode = any(n in files for n in ("SKILL.md", "skill.md"))
@@ -359,6 +533,21 @@ class SkillInstallService:
                     installed_name = manager.install_skill_from_zip(
                         str(snapshot), **kwargs
                     )
+                for name in prepared.targets:
+                    installed_dir = _target(root, name)
+                    if installed_dir.is_dir():
+                        _normalize_permissions(installed_dir, root)
+                        if os.name == "nt" and inspect_skill_permission_issue(
+                            installed_dir, root
+                        ):
+                            prefix = f"{name}/"
+                            skill_files = {
+                                k[len(prefix) :]: v
+                                for k, v in files.items()
+                                if k.startswith(prefix)
+                            }
+                            if skill_files:
+                                _replace_tree(skill_files, installed_dir)
                 result["data"] = {"skill_name": installed_name}
             else:
                 target = _target(root, prepared.skill_name)
@@ -366,7 +555,26 @@ class SkillInstallService:
                     raise ValueError("等待期间原 Skill 已改变，请重新提交并审查。")
                 writing = True
                 if prepared.operation == "file":
-                    _replace_file(files[prepared.relative], target / prepared.relative)
+                    file_target = target / prepared.relative
+                    existed = file_target.exists()
+                    old_bytes = file_target.read_bytes() if existed else None
+                    old_mode = (
+                        stat.S_IMODE(file_target.lstat().st_mode) if existed else None
+                    )
+                    try:
+                        _replace_file(files[prepared.relative], file_target)
+                        _normalize_permissions(target, root)
+                    except Exception:
+                        try:
+                            if old_bytes is not None:
+                                _write_atomic_file(old_bytes, file_target, old_mode)
+                            else:
+                                file_target.unlink(missing_ok=True)
+                        except OSError:
+                            logger.exception(
+                                "Single-file rollback failed for %s", file_target
+                            )
+                        raise
                 else:
                     _replace_tree(files, target)
                 result["data"] = {
