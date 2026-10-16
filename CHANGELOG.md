@@ -2,7 +2,7 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
+## [0.2.0]
 
 ### Added
 - 命令与交互模式支持 GitHub、skills.sh、ClawHub、腾讯 SkillHub 和 SkillsMP 链接安装/更新，下载完整候选内容后继续扫描和确认。
