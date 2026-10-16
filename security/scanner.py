@@ -592,3 +592,225 @@ def scan_files(files: dict[str, bytes], report: ScanReport) -> ScanReport:
         report.incomplete(exc.code, str(exc))
     report.finish()
     return report
+
+
+_ADMIN_ONLY_SIDS = {"SY", "BA", "LA", "S-1-5-18", "S-1-5-32-544"}
+
+
+def _get_windows_sddl(path: Path) -> str | None:
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        advapi32 = ctypes.windll.advapi32
+        kernel32 = ctypes.windll.kernel32
+        info = 0x00000001 | 0x00000004  # OWNER | DACL
+        sd = wintypes.LPVOID()
+        rc = advapi32.GetNamedSecurityInfoW(
+            wintypes.LPCWSTR(str(path)),
+            1,  # SE_FILE_OBJECT
+            info,
+            None,
+            None,
+            None,
+            None,
+            ctypes.byref(sd),
+        )
+        if rc != 0 or not sd.value:
+            return None
+        try:
+            buf = wintypes.LPWSTR()
+            if not advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                sd, 1, info, ctypes.byref(buf), None
+            ):
+                return None
+            try:
+                return buf.value
+            finally:
+                kernel32.LocalFree(buf)
+        finally:
+            kernel32.LocalFree(sd)
+    except Exception:
+        return None
+
+
+def _sddl_components(sddl: str | None) -> tuple[str, str, set[str]]:
+    if not sddl:
+        return "", "", set()
+    owner_match = re.search(r"O:([^DGS(]+)", sddl)
+    owner = owner_match.group(1) if owner_match else ""
+    dacl_match = re.search(r"D:([A-Z]*)", sddl)
+    dacl_flags = dacl_match.group(1) if dacl_match else ""
+    allow_trustees = set(re.findall(r"\(A;[^;]*;[^;]*;;;([^)]+)\)", sddl))
+    effective = {
+        owner if trustee in {"OW", "S-1-3-4"} and owner else trustee
+        for trustee in allow_trustees
+    }
+    return owner, dacl_flags, effective
+
+
+def _check_windows_sddl(
+    path_sddl: str | None, root_sddl: str | None = None
+) -> str | None:
+    if not path_sddl:
+        return None
+    _, path_flags, path_trustees = _sddl_components(path_sddl)
+    _, root_flags, root_trustees = _sddl_components(root_sddl)
+    if "P" in path_flags and "P" not in root_flags:
+        return "NTFS ACL 已禁止继承父目录权限"
+    if path_trustees and path_trustees <= _ADMIN_ONLY_SIDS:
+        if not root_trustees or (root_trustees - _ADMIN_ONLY_SIDS):
+            return "NTFS ACL 仅允许管理员或系统访问，未包含普通用户权限"
+    return None
+
+
+def inspect_skill_permission_issue(skill_dir: Path, root: Path) -> str | None:
+    try:
+        if skill_dir.is_symlink():
+            return "目录为符号链接"
+        dir_stat = skill_dir.lstat()
+        if not stat.S_ISDIR(dir_stat.st_mode):
+            return None
+    except PermissionError:
+        return "目录无读取或访问权限（PermissionError）"
+    except OSError:
+        return None
+
+    root_sddl = _get_windows_sddl(root) if os.name == "nt" else None
+    if os.name == "nt":
+        win_issue = _check_windows_sddl(_get_windows_sddl(skill_dir), root_sddl)
+        if win_issue:
+            return win_issue
+        root_uid = 0
+        required_dir_bits = 0
+        required_file_bits = 0
+    else:
+        try:
+            root_stat = root.stat()
+            root_mode = stat.S_IMODE(root_stat.st_mode)
+            root_uid = root_stat.st_uid
+        except OSError:
+            root_mode = 0o755
+            root_uid = 0
+        required_dir_bits = (root_mode & 0o055) | 0o500
+        required_file_bits = (root_mode & 0o044) | 0o400
+
+    entries = 0
+    started = time.monotonic()
+    pending = [skill_dir]
+    while pending:
+        current = pending.pop()
+        try:
+            current_stat = current.lstat()
+        except PermissionError:
+            return "目录无读取或访问权限（PermissionError）"
+        except OSError:
+            continue
+        if os.name != "nt":
+            current_mode = stat.S_IMODE(current_stat.st_mode)
+            if (current_mode & required_dir_bits) != required_dir_bits:
+                return f"目录权限为 {oct(current_mode)}，低于父目录的读取或遍历权限范围"
+            if current_stat.st_uid == 0 and root_uid != 0:
+                return "目录所有者为 root，而父目录属于普通用户"
+        elif current != skill_dir:
+            win_issue = _check_windows_sddl(_get_windows_sddl(current), root_sddl)
+            if win_issue:
+                return win_issue
+        try:
+            with os.scandir(current) as children:
+                for entry in children:
+                    entries += 1
+                    if (
+                        entries > MAX_ENTRIES
+                        or time.monotonic() - started > MAX_SCAN_SECONDS
+                    ):
+                        return None
+                    entry_path = Path(entry.path)
+                    try:
+                        entry_stat = entry.stat(follow_symlinks=False)
+                    except PermissionError:
+                        return "目录内条目无读取权限（PermissionError）"
+                    except OSError:
+                        continue
+                    if stat.S_ISDIR(entry_stat.st_mode):
+                        pending.append(entry_path)
+                    elif stat.S_ISREG(entry_stat.st_mode):
+                        if os.name != "nt":
+                            file_mode = stat.S_IMODE(entry_stat.st_mode)
+                            if (file_mode & required_file_bits) != required_file_bits:
+                                return f"文件 {entry.name} 权限为 {oct(file_mode)}，缺少与父目录匹配的读取权限"
+                        elif entry.name.lower() == "skill.md":
+                            win_issue = _check_windows_sddl(
+                                _get_windows_sddl(entry_path), root_sddl
+                            )
+                            if win_issue:
+                                return win_issue
+                            if not os.access(entry_path, os.R_OK):
+                                return "SKILL.md 缺少读取权限"
+        except PermissionError:
+            return "目录无遍历权限（PermissionError）"
+        except OSError:
+            continue
+    return None
+
+
+def audit_installed_skills(
+    root: Path,
+    report: ScanReport,
+    *,
+    plugins_root: Path | None = None,
+) -> list[dict]:
+    warnings: list[dict] = []
+    roots: list[tuple[Path, str, bool]] = [(root, "", False)]
+    if plugins_root is not None:
+        roots.append((plugins_root, "plugins/", True))
+
+    for base_root, prefix, is_plugin_root in roots:
+        try:
+            if not base_root.is_dir():
+                continue
+            with os.scandir(base_root) as it:
+                candidates = sorted(it, key=lambda item: item.name)
+        except OSError:
+            continue
+
+        for entry in candidates:
+            entry_path = Path(entry.path)
+            try:
+                is_dir = entry.is_dir(follow_symlinks=False)
+            except PermissionError:
+                is_dir = True
+            except OSError:
+                continue
+            if not is_dir or not valid_skill_name(entry.name):
+                continue
+
+            target_dir = entry_path / "skills" if is_plugin_root else entry_path
+            if is_plugin_root:
+                try:
+                    if not target_dir.exists() and os.access(
+                        entry_path, os.R_OK | os.X_OK
+                    ):
+                        continue
+                except OSError:
+                    pass
+            issue = inspect_skill_permission_issue(target_dir, base_root)
+            if not issue:
+                continue
+            label = f"{prefix}{entry.name}"
+            warnings.append({"name": entry.name, "path": label, "reason": issue})
+            if len(report.findings) < MAX_FINDINGS:
+                kind = "插件" if is_plugin_root else "Skill"
+                report.finding(
+                    "legacy_skill_permission_risk",
+                    "warning",
+                    label,
+                    1,
+                    f"已安装的旧 {kind} '{entry.name}' 存在权限范围异常（{issue}），切换非管理员或普通用户启动时可能导致无法读取并卡死回复链。",
+                )
+
+    if warnings and report.status == "complete":
+        report.finish()
+    return warnings

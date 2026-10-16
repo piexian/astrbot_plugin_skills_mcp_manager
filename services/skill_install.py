@@ -7,7 +7,10 @@ import logging
 import os
 import re
 import shutil
+import stat
+import subprocess
 import tempfile
+import uuid
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,6 +22,8 @@ from ..security.scanner import (
     MAX_TOTAL_BYTES,
     InspectionError,
     ScanReport,
+    audit_installed_skills,
+    inspect_skill_permission_issue,
     load_directory,
     load_zip,
     member_path,
@@ -77,13 +82,103 @@ def _write_tree(files: dict[str, bytes], destination: Path) -> None:
         path.write_bytes(data)
 
 
+def _make_staging_dir(base: Path, prefix: str = "skill_update_") -> Path:
+    base.mkdir(parents=True, exist_ok=True)
+    for _ in range(32):
+        candidate = base / f"{prefix}{uuid.uuid4().hex[:12]}"
+        try:
+            # Avoid mode 0o700 (used by tempfile.mkdtemp): on Windows Python 3.12.4+/3.13+,
+            # mode 0o700 applies a protected Admin-only DACL (D:P) that disables inheritance.
+            os.mkdir(candidate, 0o755)
+            return candidate
+        except FileExistsError:
+            continue
+    raise OSError("无法创建临时交换目录。")
+
+
+def _reset_windows_acl(target: Path) -> None:
+    if os.name != "nt":
+        return
+    try:
+        subprocess.run(
+            ["icacls", str(target), "/reset", "/t", "/c", "/q"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=15,
+        )
+    except Exception:
+        logger.debug("Could not run icacls reset on %s", target, exc_info=True)
+
+
+def _normalize_permissions(target: Path, root: Path) -> None:
+    if not target.exists():
+        return
+    if os.name == "nt":
+        if target.is_dir() and inspect_skill_permission_issue(target, root):
+            _reset_windows_acl(target)
+        pending = [target]
+        while pending:
+            current = pending.pop()
+            try:
+                os.chmod(current, stat.S_IREAD | stat.S_IWRITE)
+                if current.is_dir() and not current.is_symlink():
+                    with os.scandir(current) as children:
+                        for entry in children:
+                            pending.append(Path(entry.path))
+            except OSError:
+                continue
+        return
+
+    try:
+        root_stat = root.stat()
+        root_mode = stat.S_IMODE(root_stat.st_mode)
+        chown_ids = (
+            (root_stat.st_uid, root_stat.st_gid)
+            if hasattr(os, "geteuid") and os.geteuid() == 0 and root_stat.st_uid != 0
+            else None
+        )
+    except OSError:
+        root_mode = 0o755
+        chown_ids = None
+
+    dir_bits = (root_mode & 0o777) | 0o755
+    file_bits = (dir_bits & 0o666) | 0o644
+    exec_bits = (dir_bits & 0o111) | 0o111
+
+    pending = [target]
+    while pending:
+        current = pending.pop()
+        try:
+            info = current.lstat()
+        except OSError:
+            continue
+        if stat.S_ISLNK(info.st_mode):
+            continue
+        cur_mode = stat.S_IMODE(info.st_mode)
+        try:
+            if stat.S_ISDIR(info.st_mode):
+                os.chmod(current, (cur_mode | dir_bits) & 0o777)
+                with os.scandir(current) as children:
+                    for entry in children:
+                        pending.append(Path(entry.path))
+            elif stat.S_ISREG(info.st_mode):
+                extra_exec = exec_bits if (cur_mode & 0o111) else 0
+                os.chmod(current, (cur_mode | file_bits | extra_exec) & 0o777)
+            if chown_ids is not None:
+                os.chown(current, *chown_ids)
+        except OSError:
+            continue
+
+
 def _replace_tree(files: dict[str, bytes], target: Path) -> None:
     # Stage beside skills_root, never inside it: partially built skills must not be discoverable.
-    tmp = Path(tempfile.mkdtemp(prefix="skill_update_", dir=target.parent.parent))
+    tmp = _make_staging_dir(target.parent.parent)
     staged, backup = tmp / "new", tmp / "backup"
     preserve_backup = False
     try:
         _write_tree(files, staged)
+        _normalize_permissions(staged, target.parent)
         target.rename(backup)
         try:
             staged.rename(target)
@@ -94,6 +189,7 @@ def _replace_tree(files: dict[str, bytes], target: Path) -> None:
                 preserve_backup = True
                 logger.exception("Skill rollback failed; backup retained at %s", backup)
             raise
+        _normalize_permissions(target, target.parent)
     finally:
         if not preserve_backup:
             try:
@@ -113,6 +209,7 @@ def _replace_file(content: bytes, target: Path) -> None:
                 temporary.chmod(target.stat().st_mode & 0o777)
             stream.close()
             os.replace(temporary, target)
+            _normalize_permissions(target, target.parent)
         finally:
             temporary.unlink(missing_ok=True)
 
@@ -231,11 +328,18 @@ class SkillInstallService:
                 files = load_zip(Path(source))
 
             scan_files(files, report)
+            plugins_root = getattr(manager, "plugins_root", None)
+            legacy_warnings = audit_installed_skills(
+                root,
+                report,
+                plugins_root=Path(plugins_root).resolve() if plugins_root else None,
+            )
+            if legacy_warnings:
+                result["legacy_permission_warnings"] = legacy_warnings
             # Force can override content analysis, never unsafe paths or unbounded ingestion.
             if report.decision == "block" and not force:
                 result["error"] = "扫描未通过，未安装或更新 Skill。"
                 return result | {"scan": report.to_dict()}, None
-
             targets = []
             if operation == "install":
                 root_mode = any(n in files for n in ("SKILL.md", "skill.md"))
@@ -359,6 +463,21 @@ class SkillInstallService:
                     installed_name = manager.install_skill_from_zip(
                         str(snapshot), **kwargs
                     )
+                for name in prepared.targets:
+                    installed_dir = _target(root, name)
+                    if installed_dir.is_dir():
+                        _normalize_permissions(installed_dir, root)
+                        if os.name == "nt" and inspect_skill_permission_issue(
+                            installed_dir, root
+                        ):
+                            prefix = f"{name}/"
+                            skill_files = {
+                                k[len(prefix) :]: v
+                                for k, v in files.items()
+                                if k.startswith(prefix)
+                            }
+                            if skill_files:
+                                _replace_tree(skill_files, installed_dir)
                 result["data"] = {"skill_name": installed_name}
             else:
                 target = _target(root, prepared.skill_name)
@@ -367,6 +486,7 @@ class SkillInstallService:
                 writing = True
                 if prepared.operation == "file":
                     _replace_file(files[prepared.relative], target / prepared.relative)
+                    _normalize_permissions(target, root)
                 else:
                     _replace_tree(files, target)
                 result["data"] = {

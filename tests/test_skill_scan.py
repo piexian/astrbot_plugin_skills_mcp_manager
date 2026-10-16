@@ -444,3 +444,106 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         result, pending = await installer.prepare(self.manager, source)
         self.assertIsNone(pending)
         self.assertEqual(result["scan"]["decision"], "block")
+
+    def test_windows_sddl_permission_scope_detection(self):
+        parent_sddl = "O:BAD:AI(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)(A;OICIID;FA;;;BU)"
+        protected_sddl = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;OW)"
+        moved_admin_sddl = (
+            "O:BAD:AI(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)(A;OICIID;FA;;;OW)"
+        )
+        normal_sddl = "O:BAD:AI(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)(A;OICIID;FA;;;S-1-5-21-1001-1002-1003-1004)"
+        self.assertIsNotNone(scanner._check_windows_sddl(protected_sddl, parent_sddl))
+        self.assertIsNotNone(scanner._check_windows_sddl(moved_admin_sddl, parent_sddl))
+        self.assertIsNone(scanner._check_windows_sddl(normal_sddl, parent_sddl))
+
+    async def test_legacy_installed_skill_permission_risk_warns_without_blocking(self):
+        legacy = self.skills / "answer-me-with-html"
+        legacy.mkdir(mode=0o700)
+        (legacy / "SKILL.md").write_text("Legacy skill")
+        legacy.chmod(0o700)
+        plugins_dir = self.root / "plugins"
+        bad_plugin_skills = plugins_dir / "old_plugin" / "skills"
+        bad_plugin_skills.mkdir(parents=True)
+        bad_plugin_skills.chmod(0o700)
+        self.manager.plugins_root = plugins_dir
+
+        source = self.archive({"demo/SKILL.md": "Normal skill"})
+        result, pending = await self.installer.prepare(self.manager, source)
+        self.assertTrue(result["ok"])
+        self.assertIsNotNone(pending)
+        self.assertEqual(result["operation_status"], "awaiting_confirmation")
+        self.assertEqual(result["scan"]["status"], "complete")
+        self.assertEqual(result["scan"]["decision"], "warn")
+        warned_files = {
+            f["file"]
+            for f in result["scan"]["findings"]
+            if f["rule"] == "legacy_skill_permission_risk"
+            and f["severity"] == "warning"
+        }
+        self.assertEqual(warned_files, {"answer-me-with-html", "plugins/old_plugin"})
+        self.assertEqual(
+            {w["name"] for w in result["legacy_permission_warnings"]},
+            {"answer-me-with-html", "old_plugin"},
+        )
+
+    async def test_unreadable_legacy_skill_warns_without_crashing_or_blocking(self):
+        legacy = self.skills / "locked-skill"
+        legacy.mkdir()
+        (legacy / "SKILL.md").write_text("Locked")
+        real_scandir = service.os.scandir
+
+        def guarded_scandir(path):
+            if Path(path) == legacy:
+                raise PermissionError(5, "拒绝访问", str(path))
+            return real_scandir(path)
+
+        source = self.archive({"demo/SKILL.md": "Normal skill"})
+        with patch.object(scanner.os, "scandir", side_effect=guarded_scandir):
+            result, pending = await self.installer.prepare(self.manager, source)
+        self.assertTrue(result["ok"])
+        self.assertIsNotNone(pending)
+        self.assertEqual(result["scan"]["decision"], "warn")
+        self.assertTrue(
+            any(
+                f["rule"] == "legacy_skill_permission_risk"
+                and f["file"] == "locked-skill"
+                for f in result["scan"]["findings"]
+            )
+        )
+
+    async def test_install_and_update_normalize_permissions_without_mkdtemp(self):
+        target = self.installed()
+        target.chmod(0o700)
+        (target / "SKILL.md").chmod(0o600)
+        source = self.archive({"demo/SKILL.md": "Updated", "demo/sub/info.txt": "ok"})
+        with patch.object(
+            tempfile,
+            "mkdtemp",
+            side_effect=AssertionError("mkdtemp (0o700) must not be used"),
+        ):
+            result = await self.installer.run(
+                self.manager, source, operation="replace", skill_name="demo"
+            )
+        self.assertTrue(result["ok"])
+        self.assertEqual((target.stat().st_mode & 0o755), 0o755)
+        self.assertEqual(((target / "sub").stat().st_mode & 0o755), 0o755)
+        self.assertEqual(((target / "SKILL.md").stat().st_mode & 0o644), 0o644)
+        self.assertIsNone(scanner.inspect_skill_permission_issue(target, self.skills))
+
+        def install_with_0700(zip_path, *, overwrite=True):
+            installed_dir = self.skills / "new_skill"
+            installed_dir.mkdir(mode=0o700)
+            installed_dir.chmod(0o700)
+            (installed_dir / "SKILL.md").write_text("New")
+            (installed_dir / "SKILL.md").chmod(0o600)
+            return "new_skill"
+
+        self.manager.install_skill_from_zip = install_with_0700
+        install_res = await self.installer.run(
+            self.manager, self.archive({"new_skill/SKILL.md": "New"})
+        )
+        self.assertTrue(install_res["ok"])
+        new_dir = self.skills / "new_skill"
+        self.assertEqual((new_dir.stat().st_mode & 0o755), 0o755)
+        self.assertEqual(((new_dir / "SKILL.md").stat().st_mode & 0o644), 0o644)
+        self.assertIsNone(scanner.inspect_skill_permission_issue(new_dir, self.skills))
