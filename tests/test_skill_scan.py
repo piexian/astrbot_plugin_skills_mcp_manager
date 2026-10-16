@@ -453,6 +453,8 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         sid_admin_owner_sddl = "O:S-1-5-32-544D:AI(A;OICIID;FA;;;SY)(A;OICIID;FA;;;OW)"
         deny_user_sddl = "O:BAD:AI(D;OICIID;FA;;;BU)(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)(A;OICIID;FA;;;BU)"
+        deny_traverse_sddl = "O:BAD:AI(D;OICIID;FX;;;BU)(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)(A;OICIID;FA;;;BU)"
+        ds_ccsw_deny_sddl = "O:BAD:AI(D;OICIID;CCSW;;;BU)(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)(A;OICIID;FA;;;BU)"
         write_only_user_sddl = (
             "O:BAD:AI(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)(A;OICIID;FW;;;BU)"
         )
@@ -463,8 +465,12 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             "O:BAD:AI(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)(A;OICIIOID;FR;;;BU)"
         )
         inherit_only_deny_dir_sddl = "O:BAD:AI(D;OICIIO;FA;;;BU)(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)(A;OICIID;FA;;;BU)"
+        sym_file_read_sddl = "O:BAD:AI(A;ID;FA;;;SY)(A;ID;FA;;;BA)(A;ID;FR;;;BU)"
         hex_file_read_sddl = (
             "O:BAD:AI(A;ID;FA;;;SY)(A;ID;FA;;;BA)(A;ID;0x00120089;;;BU)"
+        )
+        sym_dir_read_exec_sddl = (
+            "O:BAD:AI(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)(A;OICIID;FRFX;;;BU)"
         )
         hex_dir_read_exec_sddl = (
             "O:BAD:AI(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)(A;OICIID;0x001200a9;;;BU)"
@@ -480,29 +486,37 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNotNone(scanner._check_windows_sddl(deny_user_sddl, parent_sddl))
         self.assertIsNotNone(
+            scanner._check_windows_sddl(deny_traverse_sddl, parent_sddl, is_dir=True)
+        )
+        self.assertIsNone(
+            scanner._check_windows_sddl(deny_traverse_sddl, parent_sddl, is_dir=False)
+        )
+        self.assertIsNone(scanner._check_windows_sddl(ds_ccsw_deny_sddl, parent_sddl))
+        self.assertIsNotNone(
             scanner._check_windows_sddl(write_only_user_sddl, parent_sddl)
         )
         self.assertIsNotNone(scanner._check_windows_sddl(ccrp_only_sddl, parent_sddl))
         self.assertIsNotNone(
             scanner._check_windows_sddl(inherit_only_allow_sddl, parent_sddl)
         )
-        self.assertIsNotNone(
+        # INHERIT_ONLY_ACE (IO) does not control access to the attached object itself
+        self.assertIsNone(
             scanner._check_windows_sddl(
                 inherit_only_deny_dir_sddl, parent_sddl, is_dir=True
             )
         )
-        # 0x00120089 (FILE_GENERIC_READ) lacks FILE_TRAVERSE (0x20): invalid for dir, valid for file
-        self.assertIsNotNone(
-            scanner._check_windows_sddl(hex_file_read_sddl, parent_sddl, is_dir=True)
-        )
-        self.assertIsNone(
-            scanner._check_windows_sddl(hex_file_read_sddl, parent_sddl, is_dir=False)
-        )
-        self.assertIsNone(
-            scanner._check_windows_sddl(
-                hex_dir_read_exec_sddl, parent_sddl, is_dir=True
+        # Symbolic FR and hex 0x00120089 behave identically: invalid for dir (no 0x20), valid for file
+        for file_read_sddl in (sym_file_read_sddl, hex_file_read_sddl):
+            self.assertIsNotNone(
+                scanner._check_windows_sddl(file_read_sddl, parent_sddl, is_dir=True)
             )
-        )
+            self.assertIsNone(
+                scanner._check_windows_sddl(file_read_sddl, parent_sddl, is_dir=False)
+            )
+        for dir_rx_sddl in (sym_dir_read_exec_sddl, hex_dir_read_exec_sddl):
+            self.assertIsNone(
+                scanner._check_windows_sddl(dir_rx_sddl, parent_sddl, is_dir=True)
+            )
         self.assertIsNone(scanner._check_windows_sddl(normal_sddl, parent_sddl))
 
     async def test_legacy_installed_skill_permission_risk_warns_without_blocking(self):

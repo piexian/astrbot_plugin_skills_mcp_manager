@@ -595,9 +595,16 @@ def scan_files(files: dict[str, bytes], report: ScanReport) -> ScanReport:
 
 
 _ADMIN_ONLY_SIDS = {"SY", "BA", "LA", "S-1-5-18", "S-1-5-32-544"}
-_ALLOW_READ_RE = re.compile(r"(?:FA|FR|GR|GA)", re.IGNORECASE)
-_DENY_FILE_READ_RE = re.compile(r"(?:FA|FR|GR|GA|CC)", re.IGNORECASE)
-_DENY_DIR_READ_RE = re.compile(r"(?:FA|FR|GR|GA|CC|SW)", re.IGNORECASE)
+_SDDL_RIGHT_MASKS = {
+    "GA": 0x001F01FF,
+    "FA": 0x001F01FF,
+    "GR": 0x00120089,
+    "FR": 0x00120089,
+    "GX": 0x001200A0,
+    "FX": 0x001200A0,
+    "GW": 0x00120116,
+    "FW": 0x00120116,
+}
 
 
 def _parse_ace_flags(flags: str) -> set[str]:
@@ -609,31 +616,27 @@ def _parse_ace_flags(flags: str) -> set[str]:
     }
 
 
-def _ace_grants_or_denies_read(
-    rights: str,
-    *,
-    is_deny: bool = False,
-    is_dir: bool = True,
-) -> bool:
-    hex_match = re.search(r"0x[0-9a-fA-F]+", rights)
+def _rights_to_access_mask(rights: str) -> int:
+    cleaned = rights.strip()
+    hex_match = re.fullmatch(r"0x[0-9a-fA-F]+", cleaned)
     if hex_match:
-        mask = int(hex_match.group(0), 16)
-        if is_deny:
-            deny_bits = (
-                (0x1 | 0x20 | 0x80000000 | 0x10000000)
-                if is_dir
-                else (0x1 | 0x80000000 | 0x10000000)
-            )
-            return bool(mask & deny_bits)
-        if is_dir:
-            return bool(mask & (0x80000000 | 0x10000000)) or (
-                (mask & 0x1) != 0 and (mask & 0x20) != 0
-            )
-        return bool(mask & (0x1 | 0x80000000 | 0x10000000))
-    if is_deny:
-        pattern = _DENY_DIR_READ_RE if is_dir else _DENY_FILE_READ_RE
-        return bool(pattern.search(rights))
-    return bool(_ALLOW_READ_RE.search(rights))
+        mask = int(cleaned, 16)
+        if mask & 0x10000000:
+            mask |= 0x001F01FF
+        if mask & 0x80000000:
+            mask |= 0x00120089
+        if mask & 0x20000000:
+            mask |= 0x001200A0
+        if mask & 0x40000000:
+            mask |= 0x00120116
+        return mask
+    upper = cleaned.upper()
+    mask = 0
+    for idx in range(0, len(upper), 2):
+        token = upper[idx : idx + 2]
+        if len(token) == 2:
+            mask |= _SDDL_RIGHT_MASKS.get(token, 0)
+    return mask
 
 
 def _get_windows_sddl(path: Path) -> str | None:
@@ -686,25 +689,31 @@ def _sddl_components(
     owner = owner_match.group(1).strip() if owner_match else ""
     dacl_match = re.search(r"D:([A-Z]*)", sddl)
     dacl_flags = dacl_match.group(1) if dacl_match else ""
-    allow_trustees: set[str] = set()
-    deny_trustees: set[str] = set()
+    allow_masks: dict[str, int] = {}
+    deny_masks: dict[str, int] = {}
     for ace_type, raw_flags, rights, raw_trustee in re.findall(
         r"\(([AD]);([^;]*);([^;]*);[^;]*;[^;]*;([^)]+)\)", sddl
     ):
-        flag_set = _parse_ace_flags(raw_flags)
-        is_deny = ace_type == "D"
-        if "IO" in flag_set and (
-            not is_deny or not is_dir or not (flag_set & {"OI", "CI"})
-        ):
+        if "IO" in _parse_ace_flags(raw_flags):
             continue
-        if not _ace_grants_or_denies_read(rights, is_deny=is_deny, is_dir=is_dir):
+        mask = _rights_to_access_mask(rights)
+        if mask == 0:
             continue
         trustee = raw_trustee.strip()
         resolved = owner if trustee in {"OW", "S-1-3-4"} and owner else trustee
-        if is_deny:
-            deny_trustees.add(resolved)
+        if ace_type == "D":
+            deny_masks[resolved] = deny_masks.get(resolved, 0) | mask
         else:
-            allow_trustees.add(resolved)
+            allow_masks[resolved] = allow_masks.get(resolved, 0) | mask
+    required_mask = (0x1 | 0x20) if is_dir else 0x1
+    deny_trustees = {
+        trustee for trustee, mask in deny_masks.items() if (mask & required_mask) != 0
+    }
+    allow_trustees = {
+        trustee
+        for trustee, mask in allow_masks.items()
+        if ((mask & ~deny_masks.get(trustee, 0)) & required_mask) == required_mask
+    }
     return owner, dacl_flags, allow_trustees, deny_trustees
 
 
