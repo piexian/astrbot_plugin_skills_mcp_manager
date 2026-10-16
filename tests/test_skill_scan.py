@@ -307,7 +307,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
                 "install_skill_from_zip",
                 side_effect=OSError("disk failed"),
             ),
-            self.assertLogs(service.logger, level="ERROR"),
+            self.assertLogs("astrbot", level="ERROR"),
         ):
             result = await self.installer.run(self.manager, path)
         self.assertFalse(result["ok"])
@@ -327,7 +327,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(Path, "rename", fail_new),
-            self.assertLogs(service.logger, level="ERROR"),
+            self.assertLogs("astrbot", level="ERROR"),
         ):
             result = await self.installer.run(
                 self.manager, source, operation="replace", skill_name="demo"
@@ -370,7 +370,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(Path, "rename", fail_new_and_rollback),
-            self.assertLogs(service.logger, level="ERROR"),
+            self.assertLogs("astrbot", level="ERROR"),
         ):
             result = await self.installer.run(
                 self.manager, source, operation="replace", skill_name="demo"
@@ -649,7 +649,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             patch.object(
                 service, "_normalize_permissions", side_effect=fail_on_tree_normalize
             ),
-            self.assertLogs(service.logger, level="ERROR"),
+            self.assertLogs("astrbot", level="ERROR"),
         ):
             result = await self.installer.commit(pending)
         self.assertFalse(result["ok"])
@@ -683,3 +683,35 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             for item in (target, sub, zero_file, write_only, exec_script):
                 if item.exists():
                     item.chmod(0o755)
+
+    async def test_update_rejects_readonly_plugin_and_sandbox_skills(self):
+        source = self.archive({"plugin_skill/SKILL.md": "Replacement"})
+        self.manager.is_plugin_skill = lambda name: name == "plugin_skill"
+        self.manager.is_sandbox_only_skill = lambda name: name == "sandbox_skill"
+
+        plugin_res = await self.installer.run(
+            self.manager, source, operation="replace", skill_name="plugin_skill"
+        )
+        self.assertFalse(plugin_res["ok"])
+        self.assertIn("插件内置 Skill 为只读", plugin_res["error"])
+        self.assertTrue(
+            any(
+                f["code"] == "readonly_skill" for f in plugin_res["scan"]["limitations"]
+            )
+        )
+
+        sandbox_source = self.archive({"sandbox_skill/SKILL.md": "Replacement"})
+        sandbox_res = await self.installer.run(
+            self.manager,
+            sandbox_source,
+            operation="replace",
+            skill_name="sandbox_skill",
+        )
+        self.assertFalse(sandbox_res["ok"])
+        self.assertIn("沙盒预置 Skill 为只读", sandbox_res["error"])
+        self.assertTrue(
+            any(
+                f["code"] == "readonly_skill"
+                for f in sandbox_res["scan"]["limitations"]
+            )
+        )

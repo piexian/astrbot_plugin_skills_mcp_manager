@@ -77,14 +77,14 @@ class ReviewTests(unittest.IsolatedAsyncioTestCase):
             SimpleNamespace(role="assistant", completion_text="  "),
         ):
             self.context.llm_generate.return_value = response
-            with self.assertLogs(module.logger, level="ERROR"):
+            with self.assertLogs("astrbot", level="ERROR"):
                 result = await module.ScanReview(
                     self.context, "review-provider"
                 ).review(self.result)
             self.assertEqual(result["model_review"]["status"], "failed")
             self.assertEqual(result["scan"], self.result["scan"])
         self.context.llm_generate.side_effect = RuntimeError("missing provider")
-        with self.assertLogs(module.logger, level="ERROR"):
+        with self.assertLogs("astrbot", level="ERROR"):
             result = await module.ScanReview(self.context, "missing").review(
                 self.result
             )
@@ -98,7 +98,7 @@ class ReviewTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(module.asyncio, "wait_for", timeout),
-            self.assertLogs(module.logger, level="ERROR"),
+            self.assertLogs("astrbot", level="ERROR"),
         ):
             result = await module.ScanReview(self.context, "slow").review(self.result)
         self.assertEqual(result["model_review"]["status"], "failed")

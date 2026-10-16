@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import inspect
-import logging
 import os
 import re
 import shutil
@@ -15,6 +14,8 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from astrbot.api import logger
 
 from ..security.scanner import (
     MAX_ENTRIES,
@@ -33,8 +34,6 @@ from ..security.scanner import (
     scan_files,
     valid_skill_name,
 )
-
-logger = logging.getLogger(__name__)
 
 
 def _fingerprint(files: dict[str, bytes]) -> str:
@@ -374,6 +373,16 @@ class SkillInstallService:
             if operation in {"replace", "file"}:
                 target = _target(root, skill_name)
                 if not target.is_dir():
+                    if getattr(manager, "is_plugin_skill", lambda _: False)(skill_name):
+                        raise InspectionError(
+                            "readonly_skill", "插件内置 Skill 为只读，不支持更新。"
+                        )
+                    if getattr(manager, "is_sandbox_only_skill", lambda _: False)(
+                        skill_name
+                    ):
+                        raise InspectionError(
+                            "readonly_skill", "沙盒预置 Skill 为只读，不支持更新。"
+                        )
                     raise InspectionError(
                         "missing_skill", "目标 Skill 不存在，请先安装。"
                     )

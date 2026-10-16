@@ -95,7 +95,7 @@ AI 安装工具接收本地或沙盒 ZIP 路径；使用市场链接安装时，
 
 | 命令 | 用途 |
 |---|---|
-| `/skill ls` | 列出 Skills |
+| `/skill ls` | 列出全局与当前工作区 Skills |
 | `/skill install [链接] [技能名] [--force]` | 安装 Skill，省略链接进入上传模式 |
 | `/skill update <名称> [链接] [技能名] [--force]` | 更新 Skill，省略链接进入上传模式 |
 | `/skill on <名称>` / `/skill off <名称>` | 启用 / 禁用 Skill |

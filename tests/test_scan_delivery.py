@@ -98,14 +98,19 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_provider_failure_retains_and_reloads_queue(self):
         self.owner.context.llm_generate.side_effect = RuntimeError("offline")
-        with self.assertLogs(delivery_module.logger, level="ERROR"):
+        with self.assertLogs("astrbot", level="ERROR"):
             await self.delivery.deliver(self.event, self.result)
         self.assertTrue(self.owner.store)
         self.assertIn("报告已保存", self.event.sent[-1])
         reloaded = delivery_module.ScanDelivery(self.owner)
-        request = SimpleNamespace(prompt="接着说")
+        request = SimpleNamespace(prompt="接着说", extra_user_content_parts=[])
         await reloaded.inject_pending(self.event, request)
-        self.assertIn("扫描报告", request.prompt)
+        self.assertEqual(request.prompt, "接着说")
+        self.assertEqual(len(request.extra_user_content_parts), 1)
+        injected_part = request.extra_user_content_parts[0]
+        self.assertIn("扫描报告", injected_part.text)
+        if hasattr(injected_part, "_no_save"):
+            self.assertTrue(injected_part._no_save)
         self.assertTrue(self.owner.store)  # Injection is not delivery acknowledgment.
         await reloaded.acknowledge_response(
             self.event, SimpleNamespace(role="assistant", completion_text="已收到报告")
@@ -115,9 +120,10 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_different_sessions_do_not_receive_each_others_reports(self):
         await self.delivery._enqueue(self.event.unified_msg_origin, self.result)
         other = Event("platform:private:bob")
-        request = SimpleNamespace(prompt="hello")
+        request = SimpleNamespace(prompt="hello", extra_user_content_parts=[])
         await self.delivery.inject_pending(other, request)
         self.assertEqual(request.prompt, "hello")
+        self.assertEqual(request.extra_user_content_parts, [])
         self.assertTrue(self.owner.store)
 
     async def test_language_applies_to_main_model_and_pending_report(self):
@@ -135,9 +141,10 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
                 item, _ = await delivery._enqueue(
                     self.event.unified_msg_origin, self.result
                 )
-                request = SimpleNamespace(prompt="hello")
+                request = SimpleNamespace(prompt="hello", extra_user_content_parts=[])
                 await delivery.inject_pending(self.event, request)
-                self.assertIn(instruction, request.prompt)
+                self.assertEqual(len(request.extra_user_content_parts), 1)
+                self.assertIn(instruction, request.extra_user_content_parts[0].text)
                 await delivery._ack(self.event.unified_msg_origin, {item["id"]})
 
     async def test_external_review_still_goes_to_current_session_model(self):
@@ -154,7 +161,7 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_response_only_clears_report_ids_in_that_request(self):
         await self.delivery._enqueue(self.event.unified_msg_origin, self.result)
-        request = SimpleNamespace(prompt="hello")
+        request = SimpleNamespace(prompt="hello", extra_user_content_parts=[])
         await self.delivery.inject_pending(self.event, request)
         second, _ = await self.delivery._enqueue(
             self.event.unified_msg_origin, self.result
@@ -167,7 +174,7 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_empty_or_error_response_does_not_acknowledge(self):
         await self.delivery._enqueue(self.event.unified_msg_origin, self.result)
-        request = SimpleNamespace(prompt="hello")
+        request = SimpleNamespace(prompt="hello", extra_user_content_parts=[])
         await self.delivery.inject_pending(self.event, request)
         for response in (
             SimpleNamespace(role="assistant", completion_text=""),
@@ -180,13 +187,15 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.owner.context.conversation_manager.add_message_pair.side_effect = (
             RuntimeError("storage offline")
         )
-        with self.assertLogs(delivery_module.logger, level="ERROR"):
+        with self.assertLogs("astrbot", level="ERROR"):
             await self.delivery.deliver(self.event, self.result)
         self.assertTrue(self.owner.store)
 
     async def test_interrupted_agent_does_not_acknowledge_report(self):
         await self.delivery._enqueue(self.event.unified_msg_origin, self.result)
-        await self.delivery.inject_pending(self.event, SimpleNamespace(prompt="hello"))
+        await self.delivery.inject_pending(
+            self.event, SimpleNamespace(prompt="hello", extra_user_content_parts=[])
+        )
         self.event.set_extra("agent_stop_requested", True)
         await self.delivery.acknowledge_response(
             self.event, SimpleNamespace(role="assistant", completion_text="用户中止")
@@ -203,7 +212,7 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_storage_failure_is_not_silently_claimed_persistent(self):
         self.owner.put_kv_data = AsyncMock(side_effect=RuntimeError("disk offline"))
         self.owner.context.llm_generate.side_effect = RuntimeError("model offline")
-        with self.assertLogs(delivery_module.logger, level="ERROR"):
+        with self.assertLogs("astrbot", level="ERROR"):
             await self.delivery.deliver(self.event, self.result)
         self.assertIn("暂存在内存", self.event.sent[-1])
         self.assertTrue(self.delivery._volatile)
@@ -211,8 +220,9 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_memory_report_can_be_injected_when_storage_read_fails(self):
         self.owner.get_kv_data = AsyncMock(side_effect=OSError("storage offline"))
         self.owner.context.llm_generate.side_effect = RuntimeError("model offline")
-        with self.assertLogs(delivery_module.logger, level="ERROR"):
+        with self.assertLogs("astrbot", level="ERROR"):
             await self.delivery.deliver(self.event, self.result)
-            request = SimpleNamespace(prompt="hello")
+            request = SimpleNamespace(prompt="hello", extra_user_content_parts=[])
             await self.delivery.inject_pending(self.event, request)
-        self.assertIn("扫描报告", request.prompt)
+        self.assertEqual(len(request.extra_user_content_parts), 1)
+        self.assertIn("扫描报告", request.extra_user_content_parts[0].text)

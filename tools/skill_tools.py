@@ -81,6 +81,14 @@ def _get_skill_manager() -> SkillManager:
     return SkillManager()
 
 
+def _extract_session_scope(context: Any) -> tuple[str, Any]:
+    inner = getattr(context, "context", None)
+    event = getattr(inner, "event", None)
+    umo = str(getattr(event, "unified_msg_origin", "") or "")
+    star_ctx = getattr(inner, "context", None)
+    return umo, star_ctx
+
+
 def _detect_runtime(context: ContextWrapper[AstrAgentContext]) -> str:
     """Detect current computer_use_runtime from config."""
     try:
@@ -91,6 +99,84 @@ def _detect_runtime(context: ContextWrapper[AstrAgentContext]) -> str:
     except Exception:
         logger.debug("Could not read runtime configuration; using local", exc_info=True)
         return "local"
+
+
+async def resolve_session_workspace_root(
+    umo: str, star_context: Any = None
+) -> Path | None:
+    """Resolve the current session's workspace directory."""
+    if not umo:
+        return None
+    try:
+        from astrbot.core.db import BaseDatabase
+        from astrbot.core.workspace import (
+            default_workspace_root,
+            resolve_workspace_root_for_umo,
+        )
+
+        db = getattr(star_context, "_db", None)
+        if isinstance(db, BaseDatabase):
+            return await resolve_workspace_root_for_umo(umo, db)
+        return default_workspace_root(umo)
+    except Exception:
+        pass
+    try:
+        from astrbot.core.utils.astrbot_path import get_astrbot_workspaces_path
+
+        normalized = re.sub(r"[^A-Za-z0-9._-]+", "_", umo.strip()) or "unknown"
+        return (Path(get_astrbot_workspaces_path()) / normalized).resolve(strict=False)
+    except Exception:
+        return None
+
+
+async def list_session_workspace_skills(
+    mgr: SkillManager, umo: str, star_context: Any = None
+) -> list[Any]:
+    """List request-scoped workspace skills for the current session."""
+    list_ws = getattr(mgr, "list_workspace_skills", None)
+    if not callable(list_ws) or not umo:
+        return []
+    workspace_root = await resolve_session_workspace_root(umo, star_context)
+    if workspace_root is None:
+        return []
+    try:
+        return list(list_ws(workspace_root))
+    except Exception:
+        logger.debug("Could not list workspace skills", exc_info=True)
+        return []
+
+
+def is_global_skill_present(mgr: SkillManager, name: str) -> bool:
+    """Return True if the skill exists in local skills_root, plugin skills, or sandbox cache."""
+    skills_root = getattr(mgr, "skills_root", "")
+    if skills_root and (Path(skills_root) / name).is_dir():
+        return True
+    if getattr(mgr, "is_plugin_skill", lambda _: False)(name):
+        return True
+    if getattr(mgr, "is_sandbox_only_skill", lambda _: False)(name):
+        return True
+    return False
+
+
+def is_workspace_only_skill(
+    mgr: SkillManager, name: str, workspace_skills: list[Any]
+) -> bool:
+    """Return True when the skill exists only in the current session workspace."""
+    return not is_global_skill_present(mgr, name) and any(
+        getattr(s, "name", "") == name for s in workspace_skills
+    )
+
+
+def format_skill_permission_error(
+    mgr: SkillManager, name: str, action: str, exc: Exception | None = None
+) -> str:
+    """Return an explicit Chinese explanation for read-only/protected skill errors."""
+    msg = str(exc or "").lower()
+    if getattr(mgr, "is_plugin_skill", lambda _: False)(name) or "plugin" in msg:
+        return f"Skill '{name}' 由插件提供（只读），不支持{action}；请管理对应插件。"
+    if getattr(mgr, "is_sandbox_only_skill", lambda _: False)(name) or "sandbox" in msg:
+        return f"Skill '{name}' 是沙盒预置 Skill，不支持通过本地管理{action}。"
+    return f"Skill '{name}' 为只读或受保护状态，不支持{action}。"
 
 
 def _try_sync_to_sandboxes() -> None:
@@ -207,7 +293,10 @@ class ListSkillsTool(FunctionTool):
     """List all available Skills."""
 
     name: str = "list_skills"
-    description: str = "列出所有可用的 Skills。返回每个 Skill 的名称、描述、激活状态和来源信息。无需管理员权限。"
+    description: str = (
+        "列出所有可用的 Skills，分别返回全局 Skills（本地、插件内置、沙盒预置）"
+        "与当前会话工作区 Skills（仅当前会话 local 运行时生效，不可全局加载）。无需管理员权限。"
+    )
     parameters: dict = field(
         default_factory=lambda: {
             "type": "object",
@@ -223,17 +312,59 @@ class ListSkillsTool(FunctionTool):
             mgr = _get_skill_manager()
             runtime = _detect_runtime(context)
             skills = mgr.list_skills(runtime=runtime)
-            result = [
+            umo, star_ctx = _extract_session_scope(context)
+            workspace_skills = await list_session_workspace_skills(mgr, umo, star_ctx)
+            global_names = {s.name for s in skills}
+            global_result = [
                 {
                     "name": s.name,
                     "description": s.description or "",
                     "active": s.active,
+                    "scope": "global",
+                    "global_loadable": True,
                     "source_type": s.source_type,
                     "local_exists": s.local_exists,
+                    "readonly": bool(
+                        getattr(s, "readonly", False)
+                        or s.source_type in {"plugin", "sandbox_only"}
+                    ),
+                    **(
+                        {
+                            "plugin_name": getattr(s, "plugin_name", "")
+                            or getattr(s, "source_label", "")
+                        }
+                        if s.source_type == "plugin"
+                        else {}
+                    ),
                 }
                 for s in skills
             ]
-            return _ok(data={"skills": result})
+            workspace_result = [
+                {
+                    "name": s.name,
+                    "description": s.description or "",
+                    "active": runtime == "local",
+                    "scope": "workspace",
+                    "global_loadable": False,
+                    "source_type": getattr(s, "source_type", "workspace"),
+                    "local_exists": getattr(s, "local_exists", True),
+                    "readonly": True,
+                    "overrides_global": s.name in global_names,
+                }
+                for s in workspace_skills
+            ]
+            return _ok(
+                data={
+                    "skills": global_result,
+                    "global_skills": global_result,
+                    "workspace_skills": workspace_result,
+                    "runtime": runtime,
+                    "workspace_note": (
+                        "工作区 Skills 仅在当前会话（local 运行时）按请求注入，不能全局加载，"
+                        "也不支持通过全局配置启用、禁用或删除。"
+                    ),
+                }
+            )
         except Exception:
             logger.exception("list_skills failed")
             return _err("列出 Skills 失败，请稍后重试。")
@@ -249,7 +380,7 @@ class EnableSkillTool(FunctionTool):
     """Enable a specified Skill."""
 
     name: str = "enable_skill"
-    description: str = "启用指定的 Skill。需要管理员权限。"
+    description: str = "启用指定的全局 Skill。需要管理员权限。"
     parameters: dict = field(
         default_factory=lambda: {
             "type": "object",
@@ -273,10 +404,18 @@ class EnableSkillTool(FunctionTool):
             return err
         if err := _validate_skill_name(skill_name):
             return err
+        mgr = _get_skill_manager()
         try:
-            mgr = _get_skill_manager()
+            umo, star_ctx = _extract_session_scope(context)
+            workspace_skills = await list_session_workspace_skills(mgr, umo, star_ctx)
+            if is_workspace_only_skill(mgr, skill_name, workspace_skills):
+                return _err(
+                    f"Skill '{skill_name}' 是当前会话工作区 Skill（仅在当前会话 local 运行时按请求加载，不能全局加载），不支持全局启用或禁用。"
+                )
             mgr.set_skill_active(skill_name, True)
             return _ok(message=f"已启用 Skill: {skill_name}。{_REFRESH_HINT}")
+        except PermissionError as exc:
+            return _err(format_skill_permission_error(mgr, skill_name, "启用", exc))
         except Exception:
             logger.exception("enable_skill failed")
             return _err("启用 Skill 失败，请检查 Skill 名称是否正确。")
@@ -293,7 +432,7 @@ class DisableSkillTool(FunctionTool):
 
     name: str = "disable_skill"
     description: str = (
-        "禁用指定的 Skill。需要管理员权限。禁用后该 Skill 的指令将不会被加载。"
+        "禁用指定的全局 Skill。需要管理员权限。禁用后该 Skill 的指令将不会被加载。"
     )
     parameters: dict = field(
         default_factory=lambda: {
@@ -318,10 +457,18 @@ class DisableSkillTool(FunctionTool):
             return err
         if err := _validate_skill_name(skill_name):
             return err
+        mgr = _get_skill_manager()
         try:
-            mgr = _get_skill_manager()
+            umo, star_ctx = _extract_session_scope(context)
+            workspace_skills = await list_session_workspace_skills(mgr, umo, star_ctx)
+            if is_workspace_only_skill(mgr, skill_name, workspace_skills):
+                return _err(
+                    f"Skill '{skill_name}' 是当前会话工作区 Skill（仅在当前会话 local 运行时按请求加载，不能全局加载），不支持全局启用或禁用。"
+                )
             mgr.set_skill_active(skill_name, False)
             return _ok(message=f"已禁用 Skill: {skill_name}。{_REFRESH_HINT}")
+        except PermissionError as exc:
+            return _err(format_skill_permission_error(mgr, skill_name, "禁用", exc))
         except Exception:
             logger.exception("disable_skill failed")
             return _err("禁用 Skill 失败，请检查 Skill 名称是否正确。")
@@ -338,8 +485,8 @@ class DeleteSkillTool(FunctionTool):
 
     name: str = "delete_skill"
     description: str = (
-        "删除指定的 Skill。需要管理员权限。此操作不可逆，将删除 Skill 的所有文件。"
-        "调用前务必确认用户意图。"
+        "删除指定的本地全局 Skill。需要管理员权限。此操作不可逆，将删除 Skill 的所有文件。"
+        "插件内置、沙盒预置与工作区 Skill 不支持通过此工具删除。调用前务必确认用户意图。"
     )
     parameters: dict = field(
         default_factory=lambda: {
@@ -371,10 +518,18 @@ class DeleteSkillTool(FunctionTool):
             return _err("请将 confirm 参数设为 true 以确认删除操作。")
         if err := _validate_skill_name(skill_name):
             return err
+        mgr = _get_skill_manager()
         try:
-            mgr = _get_skill_manager()
+            umo, star_ctx = _extract_session_scope(context)
+            workspace_skills = await list_session_workspace_skills(mgr, umo, star_ctx)
+            if is_workspace_only_skill(mgr, skill_name, workspace_skills):
+                return _err(
+                    f"Skill '{skill_name}' 是当前会话工作区 Skill，不支持通过全局 Skill 管理删除。"
+                )
             mgr.delete_skill(skill_name)
             return _ok(message=f"已删除 Skill: {skill_name}。{_REFRESH_HINT}")
+        except PermissionError as exc:
+            return _err(format_skill_permission_error(mgr, skill_name, "删除", exc))
         except Exception:
             logger.exception("delete_skill failed")
             return _err("删除 Skill 失败，请检查 Skill 名称是否正确。")
@@ -532,9 +687,20 @@ class UpdateSkillFromZipTool(FunctionTool):
 
         tmp_file: str | None = None
         try:
+            mgr = _get_skill_manager()
+            umo, star_ctx = _extract_session_scope(context)
+            workspace_skills = await list_session_workspace_skills(mgr, umo, star_ctx)
+            if is_workspace_only_skill(mgr, skill_name, workspace_skills):
+                return json.dumps(
+                    failed_result(
+                        f"Skill '{skill_name}' 是当前会话工作区 Skill，不支持通过全局 Skill 管理更新。",
+                        code="readonly_skill",
+                    ),
+                    ensure_ascii=False,
+                )
             actual_zip_path, tmp_file = await _resolve_zip_path(zip_path, context)
             result = await self.installer.run(
-                _get_skill_manager(),
+                mgr,
                 actual_zip_path,
                 operation="replace",
                 skill_name=skill_name,
