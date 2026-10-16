@@ -595,7 +595,25 @@ def scan_files(files: dict[str, bytes], report: ScanReport) -> ScanReport:
 
 
 _ADMIN_ONLY_SIDS = {"SY", "BA", "LA", "S-1-5-18", "S-1-5-32-544"}
-_READ_RIGHTS_RE = re.compile(r"(?:FA|FR|GR|GA|CC|LC|RP|0x[0-9a-fA-F]+)", re.IGNORECASE)
+_READ_RIGHTS_RE = re.compile(r"(?:FA|FR|GR|GA|CC|LC|RP)", re.IGNORECASE)
+_FULL_READ_RIGHTS_RE = re.compile(r"(?:FA|FR|GR|GA)", re.IGNORECASE)
+
+
+def _ace_grants_or_denies_read(rights: str, *, is_deny: bool = False) -> bool:
+    hex_match = re.search(r"0x[0-9a-fA-F]+", rights)
+    if hex_match:
+        mask = int(hex_match.group(0), 16)
+        if is_deny:
+            return bool(mask & (0x1 | 0x20 | 0x80000000 | 0x10000000))
+        return bool(mask & (0x80000000 | 0x10000000)) or (
+            (mask & 0x1) != 0 and (mask & 0x20) != 0
+        )
+    if is_deny:
+        return bool(_READ_RIGHTS_RE.search(rights))
+    upper = rights.upper()
+    return bool(_FULL_READ_RIGHTS_RE.search(upper)) or (
+        "CC" in upper and ("LC" in upper or "RP" in upper)
+    )
 
 
 def _get_windows_sddl(path: Path) -> str | None:
@@ -649,14 +667,15 @@ def _sddl_components(sddl: str | None) -> tuple[str, str, set[str], set[str]]:
     for ace_type, _flags, rights, raw_trustee in re.findall(
         r"\(([AD]);([^;]*);([^;]*);[^;]*;[^;]*;([^)]+)\)", sddl
     ):
-        if not _READ_RIGHTS_RE.search(rights):
+        is_deny = ace_type == "D"
+        if not _ace_grants_or_denies_read(rights, is_deny=is_deny):
             continue
         trustee = raw_trustee.strip()
         resolved = owner if trustee in {"OW", "S-1-3-4"} and owner else trustee
-        if ace_type == "A":
-            allow_trustees.add(resolved)
-        else:
+        if is_deny:
             deny_trustees.add(resolved)
+        else:
+            allow_trustees.add(resolved)
     return owner, dacl_flags, allow_trustees, deny_trustees
 
 
@@ -845,17 +864,17 @@ def audit_installed_skills(
                         break
                     candidates.append(item)
             candidates.sort(key=lambda item: item.name)
-        except PermissionError:
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
             _emit_legacy_warning(
                 report,
                 warnings,
                 name=base_root.name,
                 label=prefix.rstrip("/") or base_root.name,
-                issue="根目录无读取或遍历权限（PermissionError）",
+                issue=f"根目录无读取或遍历权限（{exc.__class__.__name__}）",
                 is_plugin=is_plugin_root,
             )
-            continue
-        except OSError:
             continue
 
         for entry in candidates:
@@ -892,8 +911,13 @@ def audit_installed_skills(
                         root_stat = base_root.stat()
                         req = (stat.S_IMODE(root_stat.st_mode) & 0o055) | 0o500
                         cur_mode = stat.S_IMODE(entry_stat.st_mode)
-                        if (cur_mode & req) != req or not os.access(
-                            entry_path, os.R_OK | os.X_OK
+                        owner_bad = entry_stat.st_uid != root_stat.st_uid and (
+                            entry_stat.st_uid == 0 or (cur_mode & 0o005) != 0o005
+                        )
+                        if (
+                            (cur_mode & req) != req
+                            or owner_bad
+                            or not os.access(entry_path, os.R_OK | os.X_OK)
                         ):
                             _emit_legacy_warning(
                                 report,
@@ -901,6 +925,21 @@ def audit_installed_skills(
                                 name=entry.name,
                                 label=label,
                                 issue="插件目录缺少读取或遍历权限",
+                                is_plugin=True,
+                            )
+                            continue
+                    else:
+                        win_issue = _check_windows_sddl(
+                            _get_windows_sddl(entry_path),
+                            _get_windows_sddl(base_root),
+                        )
+                        if win_issue:
+                            _emit_legacy_warning(
+                                report,
+                                warnings,
+                                name=entry.name,
+                                label=label,
+                                issue=win_issue,
                                 is_plugin=True,
                             )
                             continue
@@ -917,7 +956,15 @@ def audit_installed_skills(
                         is_plugin=True,
                     )
                     continue
-                except OSError:
+                except OSError as exc:
+                    _emit_legacy_warning(
+                        report,
+                        warnings,
+                        name=entry.name,
+                        label=label,
+                        issue=f"插件目录或 skills 子目录访问异常（{exc.__class__.__name__}）",
+                        is_plugin=True,
+                    )
                     continue
             else:
                 target_dir = entry_path

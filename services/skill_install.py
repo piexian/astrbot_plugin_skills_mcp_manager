@@ -133,6 +133,8 @@ def _normalize_permissions(target: Path, root: Path) -> None:
             issue = inspect_skill_permission_issue(target, root)
             if issue:
                 raise OSError(f"Windows 权限归一化后仍存在异常: {issue}")
+        elif not os.access(target, os.R_OK):
+            raise OSError("Windows 文件权限归一化后仍无法读取。")
         return
 
     try:
@@ -150,6 +152,7 @@ def _normalize_permissions(target: Path, root: Path) -> None:
     dir_bits = (root_mode & 0o777) | 0o700
     file_bits = (dir_bits & 0o666) | 0o600
     exec_bits = file_bits | (dir_bits & 0o111) | 0o100
+    open_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
 
     pending = [target]
     while pending:
@@ -157,21 +160,26 @@ def _normalize_permissions(target: Path, root: Path) -> None:
         info = current.lstat()
         if stat.S_ISLNK(info.st_mode):
             continue
-        cur_mode = stat.S_IMODE(info.st_mode)
-        if not os.path.samestat(info, current.lstat()):
-            raise OSError("权限归一化期间目标发生并发变更。")
-        if stat.S_ISDIR(info.st_mode):
-            os.chmod(current, dir_bits)
-            with os.scandir(current) as children:
-                for entry in children:
-                    pending.append(Path(entry.path))
-        elif stat.S_ISREG(info.st_mode):
-            os.chmod(current, exec_bits if (cur_mode & 0o111) else file_bits)
-        if chown_ids is not None:
-            try:
-                os.chown(current, *chown_ids, follow_symlinks=False)
-            except PermissionError:
-                logger.debug("Could not chown %s", current, exc_info=True)
+        fd = os.open(current, open_flags)
+        try:
+            fd_info = os.fstat(fd)
+            if not os.path.samestat(info, fd_info):
+                raise OSError("权限归一化期间目标发生并发变更。")
+            cur_mode = stat.S_IMODE(fd_info.st_mode)
+            if stat.S_ISDIR(fd_info.st_mode):
+                os.fchmod(fd, dir_bits)
+                with os.scandir(current) as children:
+                    for entry in children:
+                        pending.append(Path(entry.path))
+            elif stat.S_ISREG(fd_info.st_mode):
+                os.fchmod(fd, exec_bits if (cur_mode & 0o111) else file_bits)
+            if chown_ids is not None:
+                try:
+                    os.fchown(fd, *chown_ids)
+                except PermissionError:
+                    logger.debug("Could not chown %s", current, exc_info=True)
+        finally:
+            os.close(fd)
 
 
 def _replace_tree(files: dict[str, bytes], target: Path) -> None:
