@@ -283,6 +283,9 @@ class Main(star.Star):
             cfg = self.context.get_config(umo=event.unified_msg_origin)
             return cfg.get("provider_settings", {}).get("computer_use_runtime", "local")
         except Exception:
+            logger.debug(
+                "Could not read runtime configuration; using local", exc_info=True
+            )
             return "local"
 
     async def _resolve_readable_skill_dir(

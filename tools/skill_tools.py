@@ -119,13 +119,16 @@ async def resolve_session_workspace_root(
             return await resolve_workspace_root_for_umo(umo, db)
         return default_workspace_root(umo)
     except Exception:
-        pass
+        logger.debug(
+            "Workspace helper unavailable; trying path fallback", exc_info=True
+        )
     try:
         from astrbot.core.utils.astrbot_path import get_astrbot_workspaces_path
 
         normalized = re.sub(r"[^A-Za-z0-9._-]+", "_", umo.strip()) or "unknown"
         return (Path(get_astrbot_workspaces_path()) / normalized).resolve(strict=False)
     except Exception:
+        logger.debug("Could not resolve session workspace path", exc_info=True)
         return None
 
 
@@ -153,9 +156,7 @@ def is_global_skill_present(mgr: SkillManager, name: str) -> bool:
         return True
     if getattr(mgr, "is_plugin_skill", lambda _: False)(name):
         return True
-    if getattr(mgr, "is_sandbox_only_skill", lambda _: False)(name):
-        return True
-    return False
+    return bool(getattr(mgr, "is_sandbox_only_skill", lambda _: False)(name))
 
 
 def is_workspace_only_skill(
@@ -178,6 +179,7 @@ def get_plugin_skill_origins(mgr: SkillManager) -> dict[str, tuple[str, bool]]:
             for skill_name, plugin_name, _skill_dir, preset in iter_dirs()
         }
     except Exception:
+        logger.debug("Could not inspect plugin skill origins", exc_info=True)
         return {}
 
 
