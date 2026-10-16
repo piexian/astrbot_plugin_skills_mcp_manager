@@ -107,7 +107,7 @@ def _reset_windows_acl(target: Path) -> None:
             stderr=subprocess.DEVNULL,
             timeout=15,
         )
-    except Exception:
+    except (OSError, subprocess.SubprocessError):
         logger.debug("Could not run icacls reset on %s", target, exc_info=True)
 
 

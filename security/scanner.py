@@ -632,7 +632,7 @@ def _get_windows_sddl(path: Path) -> str | None:
                 kernel32.LocalFree(buf)
         finally:
             kernel32.LocalFree(sd)
-    except Exception:
+    except (OSError, AttributeError, ValueError):
         return None
 
 
@@ -660,9 +660,12 @@ def _check_windows_sddl(
     _, root_flags, root_trustees = _sddl_components(root_sddl)
     if "P" in path_flags and "P" not in root_flags:
         return "NTFS ACL 已禁止继承父目录权限"
-    if path_trustees and path_trustees <= _ADMIN_ONLY_SIDS:
-        if not root_trustees or (root_trustees - _ADMIN_ONLY_SIDS):
-            return "NTFS ACL 仅允许管理员或系统访问，未包含普通用户权限"
+    if (
+        path_trustees
+        and path_trustees <= _ADMIN_ONLY_SIDS
+        and (not root_trustees or (root_trustees - _ADMIN_ONLY_SIDS))
+    ):
+        return "NTFS ACL 仅允许管理员或系统访问，未包含普通用户权限"
     return None
 
 
