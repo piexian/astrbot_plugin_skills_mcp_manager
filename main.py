@@ -46,6 +46,7 @@ from .tools import (
 from .tools.skill_tools import (
     _try_sync_to_sandboxes,
     format_skill_permission_error,
+    get_plugin_skill_origins,
     is_workspace_only_skill,
     list_session_workspace_skills,
     resolve_session_workspace_root,
@@ -296,48 +297,73 @@ class Main(star.Star):
         if callable(get_plugin_dir):
             plugin_dir = get_plugin_dir(name)
             if plugin_dir is not None and Path(plugin_dir).is_dir():
-                return Path(plugin_dir).resolve(), "插件内置"
+                origins = get_plugin_skill_origins(mgr)
+                plugin_name = origins.get(name, ("", False))[0]
+                label = f"插件级:{plugin_name}" if plugin_name else "插件级"
+                return Path(plugin_dir).resolve(), label
 
         ws_root = await resolve_session_workspace_root(umo, self.context)
         if ws_root is not None:
             ws_skills_root = (ws_root / "skills").resolve(strict=False)
             ws_dir = (ws_skills_root / name).resolve(strict=False)
             if ws_dir.is_relative_to(ws_skills_root) and ws_dir.is_dir():
-                return ws_dir, "工作区"
+                return ws_dir, "工作区级"
 
         return None, ""
 
     @skill_group.command("ls")
     async def skill_ls(self, event: AstrMessageEvent) -> None:
-        """列出所有 Skills（全局与当前会话工作区分开展示）"""
+        """列出所有 Skills（全局、插件级与当前会话工作区分开展示）"""
         mgr = SkillManager()
         runtime = self._detect_runtime(event)
         skills = mgr.list_skills(runtime=runtime)
         workspace_skills = await list_session_workspace_skills(
             mgr, getattr(event, "unified_msg_origin", ""), self.context
         )
+        plugin_origins = get_plugin_skill_origins(mgr)
+
+        global_skills = [s for s in skills if getattr(s, "source_type", "") != "plugin"]
+        plugin_skills = [s for s in skills if getattr(s, "source_type", "") == "plugin"]
 
         lines = ["全局 Skills:\n"]
-        for s in skills:
+        for s in global_skills:
             status = "[运行中]" if s.active else "[已禁用]"
             source_type = getattr(s, "source_type", "")
-            if source_type == "plugin":
-                plugin_label = (
-                    getattr(s, "plugin_name", "")
-                    or getattr(s, "source_label", "")
-                    or "plugin"
-                )
-                tag = f" [插件:{plugin_label}·只读]"
-            elif source_type == "sandbox_only":
+            if source_type == "sandbox_only":
                 tag = " [沙盒预置·只读]"
             elif source_type == "both":
-                tag = " [本地+沙盒]"
+                tag = " [全局·本地+沙盒]"
             else:
-                tag = ""
-            lines.append(f"  {status}{tag} {s.name}: {s.description or '无描述'}")
+                tag = " [全局·本地]"
+            overridden_plugin = plugin_origins.get(s.name, ("", False))[0]
+            override_tag = (
+                f" [覆盖同名插件级:{overridden_plugin}]" if overridden_plugin else ""
+            )
+            lines.append(
+                f"  {status}{tag}{override_tag} {s.name}: {s.description or '无描述'}"
+            )
 
-        if not skills:
+        if not global_skills:
             lines.append("  暂无全局 Skills")
+
+        lines.append("\n插件级 Skills (随插件提供，全局可用，只读):\n")
+        for s in plugin_skills:
+            status = "[运行中]" if s.active else "[已禁用]"
+            origin_name, origin_preset = plugin_origins.get(s.name, ("", False))
+            plugin_label = (
+                getattr(s, "plugin_name", "")
+                or getattr(s, "source_label", "")
+                or origin_name
+                or "plugin"
+            )
+            preset = bool(getattr(s, "preset", False) or origin_preset)
+            ro_label = "内置只读" if preset else "只读"
+            lines.append(
+                f"  {status} [插件级:{plugin_label}·{ro_label}] {s.name}: {s.description or '无描述'}"
+            )
+
+        if not plugin_skills:
+            lines.append("  暂无插件级 Skills")
 
         lines.append("\n当前工作区 Skills (仅当前会话生效，不可全局加载):\n")
         if workspace_skills:
@@ -346,11 +372,17 @@ class Main(star.Star):
                 if runtime == "local"
                 else f"[未生效: 需 local 运行时，当前为 {runtime}]"
             )
-            global_names = {s.name for s in skills}
+            global_names = {s.name for s in global_skills}
+            plugin_names = {s.name for s in plugin_skills} | set(plugin_origins)
             for s in workspace_skills:
-                override = " [覆盖同名全局 Skill]" if s.name in global_names else ""
+                if s.name in global_names:
+                    override = " [覆盖同名全局 Skill]"
+                elif s.name in plugin_names:
+                    override = " [覆盖同名插件级 Skill]"
+                else:
+                    override = ""
                 lines.append(
-                    f"  {ws_status} [工作区·只读]{override} {s.name}: {s.description or '无描述'}"
+                    f"  {ws_status} [工作区级·只读]{override} {s.name}: {s.description or '无描述'}"
                 )
         else:
             lines.append("  暂无工作区 Skills")

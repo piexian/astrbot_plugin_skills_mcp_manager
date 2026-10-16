@@ -167,13 +167,32 @@ def is_workspace_only_skill(
     )
 
 
+def get_plugin_skill_origins(mgr: SkillManager) -> dict[str, tuple[str, bool]]:
+    """Return {skill_name: (plugin_name, preset)} for all plugin-provided skills."""
+    iter_dirs = getattr(mgr, "_iter_plugin_skill_dirs", None)
+    if not callable(iter_dirs):
+        return {}
+    try:
+        return {
+            str(skill_name): (str(plugin_name), bool(preset))
+            for skill_name, plugin_name, _skill_dir, preset in iter_dirs()
+        }
+    except Exception:
+        return {}
+
+
 def format_skill_permission_error(
     mgr: SkillManager, name: str, action: str, exc: Exception | None = None
 ) -> str:
     """Return an explicit Chinese explanation for read-only/protected skill errors."""
     msg = str(exc or "").lower()
     if getattr(mgr, "is_plugin_skill", lambda _: False)(name) or "plugin" in msg:
-        return f"Skill '{name}' 由插件提供（只读），不支持{action}；请管理对应插件。"
+        origins = get_plugin_skill_origins(mgr)
+        plugin_name = origins.get(name, ("", False))[0]
+        plugin_part = (
+            f"（所属插件: {plugin_name}，只读）" if plugin_name else "（只读）"
+        )
+        return f"Skill '{name}' 为插件级 Skill{plugin_part}，不支持{action}；请管理对应插件。"
     if getattr(mgr, "is_sandbox_only_skill", lambda _: False)(name) or "sandbox" in msg:
         return f"Skill '{name}' 是沙盒预置 Skill，不支持通过本地管理{action}。"
     return f"Skill '{name}' 为只读或受保护状态，不支持{action}。"
@@ -294,8 +313,9 @@ class ListSkillsTool(FunctionTool):
 
     name: str = "list_skills"
     description: str = (
-        "列出所有可用的 Skills，分别返回全局 Skills（本地、插件内置、沙盒预置）"
-        "与当前会话工作区 Skills（仅当前会话 local 运行时生效，不可全局加载）。无需管理员权限。"
+        "列出所有可用的 Skills，分别返回全局 Skills（本地安装、沙盒预置）、"
+        "插件级 Skills（由插件提供，全局可用但只读）与当前会话工作区 Skills"
+        "（仅当前会话 local 运行时生效，不可全局加载）。无需管理员权限。"
     )
     parameters: dict = field(
         default_factory=lambda: {
@@ -314,49 +334,86 @@ class ListSkillsTool(FunctionTool):
             skills = mgr.list_skills(runtime=runtime)
             umo, star_ctx = _extract_session_scope(context)
             workspace_skills = await list_session_workspace_skills(mgr, umo, star_ctx)
-            global_names = {s.name for s in skills}
-            global_result = [
-                {
-                    "name": s.name,
-                    "description": s.description or "",
-                    "active": s.active,
-                    "scope": "global",
-                    "global_loadable": True,
-                    "source_type": s.source_type,
-                    "local_exists": s.local_exists,
-                    "readonly": bool(
-                        getattr(s, "readonly", False)
-                        or s.source_type in {"plugin", "sandbox_only"}
-                    ),
-                    **(
-                        {
-                            "plugin_name": getattr(s, "plugin_name", "")
-                            or getattr(s, "source_label", "")
-                        }
-                        if s.source_type == "plugin"
-                        else {}
-                    ),
-                }
-                for s in skills
-            ]
+            plugin_origins = get_plugin_skill_origins(mgr)
+            all_global_names = {s.name for s in skills}
+            plugin_names = {
+                s.name for s in skills if getattr(s, "source_type", "") == "plugin"
+            } | set(plugin_origins)
+
+            all_skills_result: list[dict[str, Any]] = []
+            global_result: list[dict[str, Any]] = []
+            plugin_result: list[dict[str, Any]] = []
+
+            for s in skills:
+                source_type = getattr(s, "source_type", "local_only")
+                if source_type == "plugin":
+                    origin_name, origin_preset = plugin_origins.get(s.name, ("", False))
+                    plugin_name = (
+                        getattr(s, "plugin_name", "")
+                        or getattr(s, "source_label", "")
+                        or origin_name
+                    )
+                    preset = bool(getattr(s, "preset", False) or origin_preset)
+                    item = {
+                        "name": s.name,
+                        "description": s.description or "",
+                        "active": s.active,
+                        "level": "plugin",
+                        "scope": "plugin",
+                        "global_loadable": True,
+                        "source_type": source_type,
+                        "local_exists": s.local_exists,
+                        "readonly": True,
+                        "plugin_name": plugin_name,
+                        "preset": preset,
+                    }
+                    plugin_result.append(item)
+                else:
+                    level = "sandbox" if source_type == "sandbox_only" else "global"
+                    overridden_plugin = plugin_origins.get(s.name, ("", False))[0]
+                    item = {
+                        "name": s.name,
+                        "description": s.description or "",
+                        "active": s.active,
+                        "level": level,
+                        "scope": "global",
+                        "global_loadable": True,
+                        "source_type": source_type,
+                        "local_exists": s.local_exists,
+                        "readonly": bool(
+                            getattr(s, "readonly", False)
+                            or source_type == "sandbox_only"
+                        ),
+                        **(
+                            {"overrides_plugin": overridden_plugin}
+                            if overridden_plugin
+                            else {}
+                        ),
+                    }
+                    global_result.append(item)
+                all_skills_result.append(item)
+
             workspace_result = [
                 {
                     "name": s.name,
                     "description": s.description or "",
                     "active": runtime == "local",
+                    "level": "workspace",
                     "scope": "workspace",
                     "global_loadable": False,
                     "source_type": getattr(s, "source_type", "workspace"),
                     "local_exists": getattr(s, "local_exists", True),
                     "readonly": True,
-                    "overrides_global": s.name in global_names,
+                    "overrides_global": s.name in all_global_names,
+                    "overrides_plugin": s.name in plugin_names,
                 }
                 for s in workspace_skills
             ]
             return _ok(
                 data={
-                    "skills": global_result,
+                    "skills": all_skills_result,
                     "global_skills": global_result,
+                    "plugin_skills": plugin_result,
                     "workspace_skills": workspace_result,
                     "runtime": runtime,
                     "workspace_note": (

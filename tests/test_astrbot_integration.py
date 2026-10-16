@@ -547,32 +547,39 @@ class AstrBotIntegrationTests(unittest.IsolatedAsyncioTestCase):
             patch.object(self.tools, "_get_skill_manager", return_value=manager),
             patch.object(self.main, "SkillManager", return_value=manager),
         ):
-            # 1. ListSkillsTool separates global_skills and workspace_skills
+            # 1. ListSkillsTool separates global_skills, plugin_skills, and workspace_skills
             list_res = json.loads(await self.tools.ListSkillsTool().call(ctx))
             self.assertTrue(list_res["ok"])
             global_by_name = {s["name"]: s for s in list_res["data"]["global_skills"]}
+            plugin_by_name = {s["name"]: s for s in list_res["data"]["plugin_skills"]}
             ws_by_name = {s["name"]: s for s in list_res["data"]["workspace_skills"]}
             self.assertIn("g_skill", global_by_name)
-            self.assertIn("p_skill", global_by_name)
+            self.assertEqual(global_by_name["g_skill"]["level"], "global")
+            self.assertNotIn("p_skill", global_by_name)
             self.assertNotIn("ws_only", global_by_name)
-            self.assertTrue(global_by_name["p_skill"]["readonly"])
+            self.assertIn("p_skill", plugin_by_name)
+            self.assertEqual(plugin_by_name["p_skill"]["level"], "plugin")
+            self.assertTrue(plugin_by_name["p_skill"]["readonly"])
             self.assertEqual(
-                global_by_name["p_skill"]["plugin_name"], "astrbot_plugin_sample"
+                plugin_by_name["p_skill"]["plugin_name"], "astrbot_plugin_sample"
             )
             self.assertIn("ws_only", ws_by_name)
+            self.assertEqual(ws_by_name["ws_only"]["level"], "workspace")
             self.assertEqual(ws_by_name["ws_only"]["scope"], "workspace")
             self.assertFalse(ws_by_name["ws_only"]["global_loadable"])
             self.assertTrue(ws_by_name["ws_only"]["readonly"])
 
-            # 2. /skill ls displays global and workspace skills in separate sections
+            # 2. /skill ls displays global, plugin-level, and workspace skills in separate sections
             await self.plugin.skill_ls(event)
             ls_output = event.sent[-1]
             self.assertIn("全局 Skills:", ls_output)
-            self.assertIn("[插件:astrbot_plugin_sample·只读] p_skill", ls_output)
+            self.assertIn("[全局·本地] g_skill", ls_output)
+            self.assertIn("插件级 Skills (随插件提供，全局可用，只读):", ls_output)
+            self.assertIn("[插件级:astrbot_plugin_sample·只读] p_skill", ls_output)
             self.assertIn(
                 "当前工作区 Skills (仅当前会话生效，不可全局加载):", ls_output
             )
-            self.assertIn("[当前会话生效] [工作区·只读] ws_only", ls_output)
+            self.assertIn("[当前会话生效] [工作区级·只读] ws_only", ls_output)
 
             # 3. DeleteSkillTool & /skill del explain plugin and workspace restrictions
             del_plugin = json.loads(
@@ -581,7 +588,8 @@ class AstrBotIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
             self.assertFalse(del_plugin["ok"])
-            self.assertIn("由插件提供（只读）", del_plugin["error"])
+            self.assertIn("插件级 Skill", del_plugin["error"])
+            self.assertIn("astrbot_plugin_sample", del_plugin["error"])
 
             del_ws = json.loads(
                 await self.tools.DeleteSkillTool().call(
@@ -593,7 +601,7 @@ class AstrBotIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue((ws_skill_dir / "SKILL.md").exists())
 
             await self.plugin.skill_del(event, "p_skill")
-            self.assertIn("由插件提供（只读）", event.sent[-1])
+            self.assertIn("插件级 Skill", event.sent[-1])
             await self.plugin.skill_del(event, "ws_only")
             self.assertIn("工作区 Skill", event.sent[-1])
 
