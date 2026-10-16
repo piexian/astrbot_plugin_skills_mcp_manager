@@ -2,7 +2,27 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
-## [0.2.0]
+## [0.2.5] - 2026-10-17
+
+### Added
+- Skill 安装和更新后归一化文件权限：Linux 按父目录权限范围补足目录遍历与文件读取位，Windows 重置异常 NTFS ACL 后复核实际权限，归一化失败即回滚。
+- 安装前增加已装 Skill 和插件的权限非阻断审查，报告以 `legacy_skill_permission_risk` 提示权限范围异常，以及切换普通用户启动后可能无法读取 Skill 的风险。
+- 补充权限归一化、旧 Skill 审查、Windows SDDL 解析和 `0o000` 权限修复的单元测试。
+
+### Changed
+- 临时交换目录以 `0o755` 创建，避免 Windows Python 3.12.4+/3.13+ 上 `mkdtemp` 的 `0o700` 生成仅管理员的受保护 DACL 并阻断权限继承。
+- 已装 Skill 权限仍异常时重新写入其文件，修复权限范围。
+- 精简 README 使用说明，移除实现细节。
+
+### Fixed
+- 单文件更新在权限归一化失败时恢复原内容和权限；目录替换在归一化或切换失败时还原备份。
+- Linux 归一化改为按需设置权限位，并通过无跟随句柄确认目标未发生并发变更。
+
+### Security
+- CI 工作流权限收窄为 `contents: read`，并固定 Ruff 版本。
+- NTFS ACL 检查覆盖 DACL 继承标记、显式拒绝和仅管理员可访问等权限范围异常，SDDL 校验细化到十六进制掩码、符号权限和 IO 继承 ACE。
+
+## [0.2.0] - 2026-09-08
 
 ### Added
 - 命令与交互模式支持 GitHub、skills.sh、ClawHub、腾讯 SkillHub 和 SkillsMP 链接安装/更新，下载完整候选内容后继续扫描和确认。
