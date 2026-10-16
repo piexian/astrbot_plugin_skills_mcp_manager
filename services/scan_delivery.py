@@ -5,13 +5,14 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import logging
 import uuid
 from typing import Any
 
+from astrbot.api import logger
+from astrbot.core.agent.message import TextPart
+
 from .review_language import language_instruction, normalize_language
 
-logger = logging.getLogger(__name__)
 _EXTRA_KEY = "skills_mcp_scan_report_ids"
 _INSTRUCTIONS = (
     "你正在解释 Skills 管理器返回的静态扫描与安装结果。"
@@ -128,7 +129,7 @@ class ScanDelivery:
                 )
             )
 
-    async def inject_pending(self, event: Any, request: Any) -> None:
+    async def inject_pending(self, event: Any, req: Any) -> None:
         async with self._lock:
             try:
                 items = await self._load(event.unified_msg_origin)
@@ -141,9 +142,10 @@ class ScanDelivery:
             return
         # Deliver one report per request to bound added context without dropping queued reports.
         selected = items[:1]
-        request.prompt = (
-            (request.prompt or "") + "\n\n" + report_prompt(selected, self.language)
-        )
+        part = TextPart(text=report_prompt(selected, self.language))
+        if hasattr(part, "mark_as_temp"):
+            part = part.mark_as_temp()
+        req.extra_user_content_parts.append(part)
         event.set_extra(_EXTRA_KEY, [item["id"] for item in selected])
 
     async def acknowledge_response(self, event: Any, response: Any) -> None:

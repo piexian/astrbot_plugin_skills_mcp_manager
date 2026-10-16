@@ -43,7 +43,15 @@ from .tools import (
     UpdateMcpServerTool,
     UpdateSkillFromZipTool,
 )
-from .tools.skill_tools import _try_sync_to_sandboxes
+from .tools.skill_tools import (
+    _try_sync_to_sandboxes,
+    call_list_skills,
+    check_workspace_only_conflict,
+    format_skill_permission_error,
+    get_plugin_skill_origins,
+    list_session_workspace_skills_with_status,
+    resolve_session_workspace_root,
+)
 from .tools.utils import mask_sensitive
 
 _SKILL_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -150,16 +158,31 @@ class Main(star.Star):
                     "只有管理员可以安装或更新 Skill。", code="permission_denied"
                 )
             else:
-                file_path = await attachment.get_file()
-                result, prepared = await self.skill_installer.prepare(
-                    SkillManager(),
-                    file_path,
-                    operation=operation,
-                    skill_name=skill_name,
-                    file_name=attachment.name,
-                    archive_name=attachment.name,
-                    force=force,
+                mgr = SkillManager()
+                ws_conflict = (
+                    await check_workspace_only_conflict(
+                        mgr,
+                        skill_name,
+                        getattr(event, "unified_msg_origin", ""),
+                        self.context,
+                        "，不支持通过全局 Skill 管理更新。",
+                    )
+                    if skill_name
+                    else None
                 )
+                if ws_conflict:
+                    result = failed_result(ws_conflict, code="readonly_skill")
+                else:
+                    file_path = await attachment.get_file()
+                    result, prepared = await self.skill_installer.prepare(
+                        mgr,
+                        file_path,
+                        operation=operation,
+                        skill_name=skill_name,
+                        file_name=attachment.name,
+                        archive_name=attachment.name,
+                        force=force,
+                    )
         except Exception:
             logger.exception("Skill upload preparation failed")
             result = failed_result("无法取得上传文件或初始化安装服务。")
@@ -181,21 +204,36 @@ class Main(star.Star):
                     "只有管理员可以安装或更新 Skill。", code="permission_denied"
                 )
             else:
-                bundle = await self.skill_sources.resolve(url, selection)
-                with tempfile.TemporaryDirectory(prefix="skill_link_") as tmp:
-                    archive = Path(tmp) / "skill.zip"
-                    name = skill_name or bundle.name
-                    with zipfile.ZipFile(archive, "w", zipfile.ZIP_STORED) as zf:
-                        for path, content in bundle.files.items():
-                            zf.writestr(name + "/" + path, content)
-                    result, prepared = await self.skill_installer.prepare(
-                        SkillManager(),
-                        str(archive),
-                        operation="replace" if skill_name else "install",
-                        skill_name=skill_name,
-                        force=force,
+                mgr = SkillManager()
+                ws_conflict = (
+                    await check_workspace_only_conflict(
+                        mgr,
+                        skill_name,
+                        getattr(event, "unified_msg_origin", ""),
+                        self.context,
+                        "，不支持通过全局 Skill 管理更新。",
                     )
-                result["source"] = bundle.provenance
+                    if skill_name
+                    else None
+                )
+                if ws_conflict:
+                    result = failed_result(ws_conflict, code="readonly_skill")
+                else:
+                    bundle = await self.skill_sources.resolve(url, selection)
+                    with tempfile.TemporaryDirectory(prefix="skill_link_") as tmp:
+                        archive = Path(tmp) / "skill.zip"
+                        name = skill_name or bundle.name
+                        with zipfile.ZipFile(archive, "w", zipfile.ZIP_STORED) as zf:
+                            for path, content in bundle.files.items():
+                                zf.writestr(name + "/" + path, content)
+                        result, prepared = await self.skill_installer.prepare(
+                            mgr,
+                            str(archive),
+                            operation="replace" if skill_name else "install",
+                            skill_name=skill_name,
+                            force=force,
+                        )
+                    result["source"] = bundle.provenance
         except SourceError as exc:
             result = failed_result(str(exc), code="source_unavailable")
         except Exception:
@@ -239,19 +277,168 @@ class Main(star.Star):
     def skill_group(self) -> None:
         """Skill 管理命令组"""
 
+    def _detect_runtime(self, event: AstrMessageEvent) -> str:
+        try:
+            cfg = self.context.get_config(umo=event.unified_msg_origin)
+            return cfg.get("provider_settings", {}).get("computer_use_runtime", "local")
+        except Exception:
+            logger.debug(
+                "Could not read runtime configuration; using local", exc_info=True
+            )
+            return "local"
+
+    async def _resolve_workspace_skill_dir(
+        self, mgr: SkillManager, name: str, umo: str
+    ) -> tuple[Path | None, str]:
+        if not callable(getattr(mgr, "list_workspace_skills", None)) or not umo:
+            return None, ""
+        try:
+            ws_root = await resolve_session_workspace_root(umo, self.context)
+            if ws_root is None:
+                return None, ""
+            resolved_ws_root = Path(ws_root).resolve(strict=True)
+            ws_skills_root = (resolved_ws_root / "skills").resolve(strict=True)
+            ws_dir = (ws_skills_root / name).resolve(strict=True)
+            if (
+                ws_skills_root.is_relative_to(resolved_ws_root)
+                and ws_dir.is_relative_to(ws_skills_root)
+                and ws_dir.is_dir()
+                and (ws_dir / "SKILL.md").is_file()
+            ):
+                return ws_dir, "工作区级"
+        except Exception:
+            logger.debug("Could not resolve workspace skill directory", exc_info=True)
+        return None, ""
+
+    def _resolve_local_or_plugin_skill_dir(
+        self, mgr: SkillManager, name: str
+    ) -> tuple[Path | None, str]:
+        skills_root = Path(mgr.skills_root).resolve()
+        local_dir = (skills_root / name).resolve()
+        if local_dir.is_relative_to(skills_root) and local_dir.is_dir():
+            return local_dir, "全局"
+
+        get_plugin_dir = getattr(mgr, "_get_plugin_skill_dir", None)
+        if callable(get_plugin_dir):
+            plugin_dir = get_plugin_dir(name)
+            if plugin_dir is not None and Path(plugin_dir).is_dir():
+                resolved_plugin_dir = Path(plugin_dir).resolve()
+                allowed_roots: list[Path] = []
+                plugins_root = getattr(mgr, "plugins_root", None)
+                if plugins_root:
+                    allowed_roots.append(Path(plugins_root).resolve())
+                try:
+                    from astrbot.core.utils.astrbot_path import (
+                        get_astrbot_builtin_plugin_path,
+                    )
+
+                    allowed_roots.append(
+                        Path(get_astrbot_builtin_plugin_path()).resolve()
+                    )
+                except Exception:
+                    logger.debug(
+                        "Builtin plugin path helper unavailable", exc_info=True
+                    )
+                if any(
+                    resolved_plugin_dir.is_relative_to(root) for root in allowed_roots
+                ):
+                    origins = get_plugin_skill_origins(mgr)
+                    plugin_name = origins.get(name, ("", False))[0]
+                    label = f"插件级:{plugin_name}" if plugin_name else "插件级"
+                    return resolved_plugin_dir, label
+        return None, ""
+
+    async def _resolve_readable_skill_dir(
+        self, mgr: SkillManager, name: str, umo: str, runtime: str = "local"
+    ) -> tuple[Path | None, str]:
+        if runtime == "local":
+            ws_dir, ws_label = await self._resolve_workspace_skill_dir(mgr, name, umo)
+            if ws_dir is not None:
+                return ws_dir, ws_label
+            return self._resolve_local_or_plugin_skill_dir(mgr, name)
+
+        dir_path, label = self._resolve_local_or_plugin_skill_dir(mgr, name)
+        if dir_path is not None:
+            return dir_path, label
+        return await self._resolve_workspace_skill_dir(mgr, name, umo)
+
     @skill_group.command("ls")
     async def skill_ls(self, event: AstrMessageEvent) -> None:
-        """列出所有 Skills"""
+        """列出所有 Skills（全局、插件级与当前会话工作区分开展示）"""
         mgr = SkillManager()
-        skills = mgr.list_skills()
+        runtime = self._detect_runtime(event)
+        skills = call_list_skills(mgr, runtime)
+        workspace_skills, ws_error = await list_session_workspace_skills_with_status(
+            mgr, getattr(event, "unified_msg_origin", ""), self.context
+        )
+        plugin_origins = get_plugin_skill_origins(mgr)
 
-        lines = ["Skills 列表:\n"]
-        for s in skills:
+        global_skills = [s for s in skills if getattr(s, "source_type", "") != "plugin"]
+        plugin_skills = [s for s in skills if getattr(s, "source_type", "") == "plugin"]
+
+        lines = ["全局 Skills:\n"]
+        for s in global_skills:
             status = "[运行中]" if s.active else "[已禁用]"
-            lines.append(f"  {status} {s.name}: {s.description or '无描述'}")
+            source_type = getattr(s, "source_type", "")
+            if source_type == "sandbox_only":
+                tag = " [沙盒预置·只读]"
+            elif source_type == "both":
+                tag = " [全局·本地+沙盒]"
+            else:
+                tag = " [全局·本地]"
+            overridden_plugin = plugin_origins.get(s.name, ("", False))[0]
+            override_tag = (
+                f" [覆盖同名插件级:{overridden_plugin}]" if overridden_plugin else ""
+            )
+            lines.append(
+                f"  {status}{tag}{override_tag} {s.name}: {s.description or '无描述'}"
+            )
 
-        if not skills:
-            lines.append("  暂无 Skills")
+        if not global_skills:
+            lines.append("  暂无全局 Skills")
+
+        lines.append("\n插件级 Skills (随插件提供，全局可用，只读):\n")
+        for s in plugin_skills:
+            status = "[运行中]" if s.active else "[已禁用]"
+            origin_name, origin_preset = plugin_origins.get(s.name, ("", False))
+            plugin_label = (
+                getattr(s, "plugin_name", "")
+                or getattr(s, "source_label", "")
+                or origin_name
+                or "plugin"
+            )
+            preset = bool(getattr(s, "preset", False) or origin_preset)
+            ro_label = "内置只读" if preset else "只读"
+            lines.append(
+                f"  {status} [插件级:{plugin_label}·{ro_label}] {s.name}: {s.description or '无描述'}"
+            )
+
+        if not plugin_skills:
+            lines.append("  暂无插件级 Skills")
+
+        lines.append("\n当前工作区 Skills (仅当前会话生效，不可全局加载):\n")
+        if ws_error:
+            lines.append(f"  [查询失败] {ws_error}")
+        elif workspace_skills:
+            ws_status = (
+                "[当前会话生效]"
+                if runtime == "local"
+                else f"[未生效: 需 local 运行时，当前为 {runtime}]"
+            )
+            global_names = {s.name for s in global_skills}
+            plugin_names = {s.name for s in plugin_skills} | set(plugin_origins)
+            for s in workspace_skills:
+                if s.name in global_names:
+                    override = " [覆盖同名全局 Skill]"
+                elif s.name in plugin_names:
+                    override = " [覆盖同名插件级 Skill]"
+                else:
+                    override = ""
+                lines.append(
+                    f"  {ws_status} [工作区级·只读]{override} {s.name}: {s.description or '无描述'}"
+                )
+        else:
+            lines.append("  暂无工作区 Skills")
 
         event.set_result(MessageEventResult().message("\n".join(lines)).use_t2i(False))
 
@@ -265,12 +452,27 @@ class Main(star.Star):
         if not _SKILL_NAME_RE.fullmatch(name):
             event.set_result(MessageEventResult().message(f"[失败] 无效名称: {name}"))
             return
+        mgr = SkillManager()
         try:
-            mgr = SkillManager()
+            if ws_conflict := await check_workspace_only_conflict(
+                mgr,
+                name,
+                getattr(event, "unified_msg_origin", ""),
+                self.context,
+                "（仅在当前会话 local 运行时按请求加载，不能全局加载），不支持全局启用或禁用",
+            ):
+                event.set_result(MessageEventResult().message(f"[失败] {ws_conflict}"))
+                return
             mgr.set_skill_active(name, True)
             event.set_result(
                 MessageEventResult().message(
                     f"[成功] 已启用 Skill: {name}\n提示: 下一次对话生效"
+                )
+            )
+        except PermissionError as exc:
+            event.set_result(
+                MessageEventResult().message(
+                    f"[失败] {format_skill_permission_error(mgr, name, '启用', exc)}"
                 )
             )
         except Exception:
@@ -289,12 +491,27 @@ class Main(star.Star):
         if not _SKILL_NAME_RE.fullmatch(name):
             event.set_result(MessageEventResult().message(f"[失败] 无效名称: {name}"))
             return
+        mgr = SkillManager()
         try:
-            mgr = SkillManager()
+            if ws_conflict := await check_workspace_only_conflict(
+                mgr,
+                name,
+                getattr(event, "unified_msg_origin", ""),
+                self.context,
+                "（仅在当前会话 local 运行时按请求加载，不能全局加载），不支持全局启用或禁用",
+            ):
+                event.set_result(MessageEventResult().message(f"[失败] {ws_conflict}"))
+                return
             mgr.set_skill_active(name, False)
             event.set_result(
                 MessageEventResult().message(
                     f"[成功] 已禁用 Skill: {name}\n提示: 下一次对话生效"
+                )
+            )
+        except PermissionError as exc:
+            event.set_result(
+                MessageEventResult().message(
+                    f"[失败] {format_skill_permission_error(mgr, name, '禁用', exc)}"
                 )
             )
         except Exception:
@@ -313,12 +530,27 @@ class Main(star.Star):
         if not _SKILL_NAME_RE.fullmatch(name):
             event.set_result(MessageEventResult().message(f"[失败] 无效名称: {name}"))
             return
+        mgr = SkillManager()
         try:
-            mgr = SkillManager()
+            if ws_conflict := await check_workspace_only_conflict(
+                mgr,
+                name,
+                getattr(event, "unified_msg_origin", ""),
+                self.context,
+                "，不支持通过全局 Skill 管理删除",
+            ):
+                event.set_result(MessageEventResult().message(f"[失败] {ws_conflict}"))
+                return
             mgr.delete_skill(name)
             event.set_result(
                 MessageEventResult().message(
                     f"[成功] 已删除 Skill: {name}\n提示: 下一次对话生效"
+                )
+            )
+        except PermissionError as exc:
+            event.set_result(
+                MessageEventResult().message(
+                    f"[失败] {format_skill_permission_error(mgr, name, '删除', exc)}"
                 )
             )
         except Exception:
@@ -339,23 +571,19 @@ class Main(star.Star):
             return
 
         mgr = SkillManager()
-        skills_root = Path(mgr.skills_root)
-        skill_dir = (skills_root / name).resolve()
-
-        if not skill_dir.exists():
+        skill_dir, scope_label = await self._resolve_readable_skill_dir(
+            mgr,
+            name,
+            getattr(event, "unified_msg_origin", ""),
+            runtime=self._detect_runtime(event),
+        )
+        if skill_dir is None:
             event.set_result(
                 MessageEventResult().message(f"[失败] Skill 不存在: {name}")
             )
             return
 
-        # Security check: ensure skill_dir is within skills_root
-        try:
-            skill_dir.relative_to(skills_root.resolve())
-        except ValueError:
-            event.set_result(MessageEventResult().message("[失败] 非法路径"))
-            return
-
-        lines = [f"Skill {name} 文件结构:\n"]
+        lines = [f"Skill {name} ({scope_label}) 文件结构:\n"]
         for root, dirs, files in os.walk(skill_dir):
             rel_root = Path(root).relative_to(skill_dir)
             level = len(rel_root.parts)
@@ -387,8 +615,18 @@ class Main(star.Star):
             return
 
         mgr = SkillManager()
-        skills_root = Path(mgr.skills_root)
-        skill_dir = (skills_root / name).resolve()
+        skill_dir, _scope_label = await self._resolve_readable_skill_dir(
+            mgr,
+            name,
+            getattr(event, "unified_msg_origin", ""),
+            runtime=self._detect_runtime(event),
+        )
+        if skill_dir is None:
+            event.set_result(
+                MessageEventResult().message(f"[失败] Skill 不存在: {name}")
+            )
+            return
+
         file_path = (skill_dir / file).resolve()
 
         # Security check: constrain to the specific skill directory

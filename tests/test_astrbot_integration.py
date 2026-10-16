@@ -201,7 +201,7 @@ class AstrBotIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         with (
             patch.object(self.main, "SkillManager", return_value=self.manager),
-            self.assertLogs(level="ERROR"),
+            self.assertLogs("astrbot", level="ERROR"),
         ):
             result, candidate = await plugin._prepare_skill_upload(event, attachment)
         self.assertIsNotNone(candidate)
@@ -500,3 +500,155 @@ class AstrBotIntegrationTests(unittest.IsolatedAsyncioTestCase):
         result = await self.plugin.skill_installer.run(manager, self.archive())
         self.assertTrue(result["ok"], result)
         self.assertTrue(Path(manager.skills_root, "demo", "SKILL.md").exists())
+
+    async def test_workspace_and_plugin_skills_separated_and_guarded(self):
+        if not hasattr(self.manager_class, "list_workspace_skills"):
+            self.skipTest("AstrBot version does not support workspace/plugin skills")
+
+        plugins_root = self.root / "plugins"
+        plugin_skill_dir = plugins_root / "astrbot_plugin_sample" / "skills" / "p_skill"
+        plugin_skill_dir.mkdir(parents=True)
+        (plugin_skill_dir / "SKILL.md").write_text(
+            "---\ndescription: Plugin provided skill\n---\nBody",
+            encoding="utf-8",
+        )
+
+        manager = self.manager_class(
+            skills_root=str(self.root / "skills"),
+            plugins_root=str(plugins_root),
+        )
+        await self.plugin.skill_installer.run(manager, self.archive(name="g_skill"))
+
+        umo = "platform:private:ws-user"
+        ws_root = await self.tools.resolve_session_workspace_root(umo, None)
+        self.assertIsNotNone(ws_root)
+        ws_skill_dir = Path(ws_root) / "skills" / "ws_only"
+        ws_skill_dir.mkdir(parents=True, exist_ok=True)
+        (ws_skill_dir / "SKILL.md").write_text(
+            "---\ndescription: Workspace scoped skill\n---\nBody",
+            encoding="utf-8",
+        )
+
+        event = Event(umo)
+        event.role = "admin"
+        event.set_result = lambda res: event.sent.append(res.get_plain_text())
+        ctx = SimpleNamespace(
+            context=SimpleNamespace(
+                event=event,
+                context=SimpleNamespace(
+                    get_config=lambda umo=None: {
+                        "provider_settings": {"computer_use_runtime": "local"}
+                    }
+                ),
+            )
+        )
+
+        with (
+            patch.object(self.tools, "_get_skill_manager", return_value=manager),
+            patch.object(self.main, "SkillManager", return_value=manager),
+        ):
+            # 1. ListSkillsTool separates global_skills, plugin_skills, and workspace_skills
+            list_res = json.loads(await self.tools.ListSkillsTool().call(ctx))
+            self.assertTrue(list_res["ok"])
+            global_by_name = {s["name"]: s for s in list_res["data"]["global_skills"]}
+            plugin_by_name = {s["name"]: s for s in list_res["data"]["plugin_skills"]}
+            ws_by_name = {s["name"]: s for s in list_res["data"]["workspace_skills"]}
+            self.assertIn("g_skill", global_by_name)
+            self.assertEqual(global_by_name["g_skill"]["level"], "global")
+            self.assertNotIn("p_skill", global_by_name)
+            self.assertNotIn("ws_only", global_by_name)
+            self.assertIn("p_skill", plugin_by_name)
+            self.assertEqual(plugin_by_name["p_skill"]["level"], "plugin")
+            self.assertTrue(plugin_by_name["p_skill"]["readonly"])
+            self.assertEqual(
+                plugin_by_name["p_skill"]["plugin_name"], "astrbot_plugin_sample"
+            )
+            self.assertIn("ws_only", ws_by_name)
+            self.assertEqual(ws_by_name["ws_only"]["level"], "workspace")
+            self.assertEqual(ws_by_name["ws_only"]["scope"], "workspace")
+            self.assertFalse(ws_by_name["ws_only"]["global_loadable"])
+            self.assertTrue(ws_by_name["ws_only"]["readonly"])
+
+            # 2. /skill ls displays global, plugin-level, and workspace skills in separate sections
+            await self.plugin.skill_ls(event)
+            ls_output = event.sent[-1]
+            self.assertIn("全局 Skills:", ls_output)
+            self.assertIn("[全局·本地] g_skill", ls_output)
+            self.assertIn("插件级 Skills (随插件提供，全局可用，只读):", ls_output)
+            self.assertIn("[插件级:astrbot_plugin_sample·只读] p_skill", ls_output)
+            self.assertIn(
+                "当前工作区 Skills (仅当前会话生效，不可全局加载):", ls_output
+            )
+            self.assertIn("[当前会话生效] [工作区级·只读] ws_only", ls_output)
+
+            # 3. DeleteSkillTool & /skill del explain plugin and workspace restrictions
+            del_plugin = json.loads(
+                await self.tools.DeleteSkillTool().call(
+                    ctx, skill_name="p_skill", confirm=True
+                )
+            )
+            self.assertFalse(del_plugin["ok"])
+            self.assertIn("插件级 Skill", del_plugin["error"])
+            self.assertIn("astrbot_plugin_sample", del_plugin["error"])
+            self.assertTrue((plugin_skill_dir / "SKILL.md").exists())
+
+            del_ws = json.loads(
+                await self.tools.DeleteSkillTool().call(
+                    ctx, skill_name="ws_only", confirm=True
+                )
+            )
+            self.assertFalse(del_ws["ok"])
+            self.assertIn("工作区 Skill", del_ws["error"])
+            self.assertTrue((ws_skill_dir / "SKILL.md").exists())
+
+            await self.plugin.skill_del(event, "p_skill")
+            self.assertIn("插件级 Skill", event.sent[-1])
+            self.assertTrue((plugin_skill_dir / "SKILL.md").exists())
+            await self.plugin.skill_del(event, "ws_only")
+            self.assertIn("工作区 Skill", event.sent[-1])
+
+            # 4. Enable/Disable rejects workspace-only skill, allows plugin skill
+            off_ws = json.loads(
+                await self.tools.DisableSkillTool().call(ctx, skill_name="ws_only")
+            )
+            self.assertFalse(off_ws["ok"])
+            self.assertIn("不能全局加载", off_ws["error"])
+
+            off_plugin = json.loads(
+                await self.tools.DisableSkillTool().call(ctx, skill_name="p_skill")
+            )
+            self.assertTrue(off_plugin["ok"])
+            skills_after = {
+                s.name: s.active for s in manager.list_skills(runtime="local")
+            }
+            self.assertFalse(skills_after["p_skill"])
+
+            # 5. Same-named workspace skill overrides plugin (not global) and is preferred by /skill read in local runtime
+            ws_override_dir = Path(ws_root) / "skills" / "p_skill"
+            ws_override_dir.mkdir(parents=True, exist_ok=True)
+            (ws_override_dir / "SKILL.md").write_text(
+                "---\ndescription: Workspace override\n---\nWS_OVERRIDE_BODY",
+                encoding="utf-8",
+            )
+            override_res = json.loads(await self.tools.ListSkillsTool().call(ctx))
+            ws_override = {
+                s["name"]: s for s in override_res["data"]["workspace_skills"]
+            }["p_skill"]
+            self.assertFalse(ws_override["overrides_global"])
+            self.assertTrue(ws_override["overrides_plugin"])
+
+            await self.plugin.skill_read(event, "p_skill", "SKILL.md")
+            self.assertIn("WS_OVERRIDE_BODY", event.sent[-1])
+
+            # 6. Plugin skill symlink escaping plugins_root is rejected by _resolve_readable_skill_dir
+            outside_dir = self.root / "outside_secret"
+            outside_dir.mkdir(parents=True, exist_ok=True)
+            (outside_dir / "SKILL.md").write_text("SECRET", encoding="utf-8")
+            escaped_link = (
+                plugins_root / "astrbot_plugin_sample" / "skills" / "escaped_skill"
+            )
+            escaped_link.symlink_to(outside_dir, target_is_directory=True)
+            resolved_dir, _ = await self.plugin._resolve_readable_skill_dir(
+                manager, "escaped_skill", umo, runtime="local"
+            )
+            self.assertIsNone(resolved_dir)
