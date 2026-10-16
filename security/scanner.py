@@ -595,25 +595,45 @@ def scan_files(files: dict[str, bytes], report: ScanReport) -> ScanReport:
 
 
 _ADMIN_ONLY_SIDS = {"SY", "BA", "LA", "S-1-5-18", "S-1-5-32-544"}
-_READ_RIGHTS_RE = re.compile(r"(?:FA|FR|GR|GA|CC|LC|RP)", re.IGNORECASE)
-_FULL_READ_RIGHTS_RE = re.compile(r"(?:FA|FR|GR|GA)", re.IGNORECASE)
+_ALLOW_READ_RE = re.compile(r"(?:FA|FR|GR|GA)", re.IGNORECASE)
+_DENY_FILE_READ_RE = re.compile(r"(?:FA|FR|GR|GA|CC)", re.IGNORECASE)
+_DENY_DIR_READ_RE = re.compile(r"(?:FA|FR|GR|GA|CC|SW)", re.IGNORECASE)
 
 
-def _ace_grants_or_denies_read(rights: str, *, is_deny: bool = False) -> bool:
+def _parse_ace_flags(flags: str) -> set[str]:
+    cleaned = flags.strip().upper()
+    return {
+        cleaned[i : i + 2]
+        for i in range(0, len(cleaned), 2)
+        if len(cleaned[i : i + 2]) == 2
+    }
+
+
+def _ace_grants_or_denies_read(
+    rights: str,
+    *,
+    is_deny: bool = False,
+    is_dir: bool = True,
+) -> bool:
     hex_match = re.search(r"0x[0-9a-fA-F]+", rights)
     if hex_match:
         mask = int(hex_match.group(0), 16)
         if is_deny:
-            return bool(mask & (0x1 | 0x20 | 0x80000000 | 0x10000000))
-        return bool(mask & (0x80000000 | 0x10000000)) or (
-            (mask & 0x1) != 0 and (mask & 0x20) != 0
-        )
+            deny_bits = (
+                (0x1 | 0x20 | 0x80000000 | 0x10000000)
+                if is_dir
+                else (0x1 | 0x80000000 | 0x10000000)
+            )
+            return bool(mask & deny_bits)
+        if is_dir:
+            return bool(mask & (0x80000000 | 0x10000000)) or (
+                (mask & 0x1) != 0 and (mask & 0x20) != 0
+            )
+        return bool(mask & (0x1 | 0x80000000 | 0x10000000))
     if is_deny:
-        return bool(_READ_RIGHTS_RE.search(rights))
-    upper = rights.upper()
-    return bool(_FULL_READ_RIGHTS_RE.search(upper)) or (
-        "CC" in upper and ("LC" in upper or "RP" in upper)
-    )
+        pattern = _DENY_DIR_READ_RE if is_dir else _DENY_FILE_READ_RE
+        return bool(pattern.search(rights))
+    return bool(_ALLOW_READ_RE.search(rights))
 
 
 def _get_windows_sddl(path: Path) -> str | None:
@@ -655,7 +675,11 @@ def _get_windows_sddl(path: Path) -> str | None:
         return None
 
 
-def _sddl_components(sddl: str | None) -> tuple[str, str, set[str], set[str]]:
+def _sddl_components(
+    sddl: str | None,
+    *,
+    is_dir: bool = True,
+) -> tuple[str, str, set[str], set[str]]:
     if not sddl:
         return "", "", set(), set()
     owner_match = re.search(r"O:(.*?)(?=(?:[GDS]:|\(|$))", sddl)
@@ -664,11 +688,16 @@ def _sddl_components(sddl: str | None) -> tuple[str, str, set[str], set[str]]:
     dacl_flags = dacl_match.group(1) if dacl_match else ""
     allow_trustees: set[str] = set()
     deny_trustees: set[str] = set()
-    for ace_type, _flags, rights, raw_trustee in re.findall(
+    for ace_type, raw_flags, rights, raw_trustee in re.findall(
         r"\(([AD]);([^;]*);([^;]*);[^;]*;[^;]*;([^)]+)\)", sddl
     ):
+        flag_set = _parse_ace_flags(raw_flags)
         is_deny = ace_type == "D"
-        if not _ace_grants_or_denies_read(rights, is_deny=is_deny):
+        if "IO" in flag_set and (
+            not is_deny or not is_dir or not (flag_set & {"OI", "CI"})
+        ):
+            continue
+        if not _ace_grants_or_denies_read(rights, is_deny=is_deny, is_dir=is_dir):
             continue
         trustee = raw_trustee.strip()
         resolved = owner if trustee in {"OW", "S-1-3-4"} and owner else trustee
@@ -680,12 +709,17 @@ def _sddl_components(sddl: str | None) -> tuple[str, str, set[str], set[str]]:
 
 
 def _check_windows_sddl(
-    path_sddl: str | None, root_sddl: str | None = None
+    path_sddl: str | None,
+    root_sddl: str | None = None,
+    *,
+    is_dir: bool = True,
 ) -> str | None:
     if not path_sddl:
         return None
-    _, path_flags, path_trustees, path_denied = _sddl_components(path_sddl)
-    _, root_flags, root_trustees, _ = _sddl_components(root_sddl)
+    _, path_flags, path_trustees, path_denied = _sddl_components(
+        path_sddl, is_dir=is_dir
+    )
+    _, root_flags, root_trustees, _ = _sddl_components(root_sddl, is_dir=True)
     if "P" in path_flags and "P" not in root_flags:
         return "NTFS ACL 已禁止继承父目录权限"
     root_non_admin = root_trustees - _ADMIN_ONLY_SIDS
@@ -719,7 +753,9 @@ def inspect_skill_permission_issue(
 
     root_sddl = _get_windows_sddl(root) if os.name == "nt" else None
     if os.name == "nt":
-        win_issue = _check_windows_sddl(_get_windows_sddl(skill_dir), root_sddl)
+        win_issue = _check_windows_sddl(
+            _get_windows_sddl(skill_dir), root_sddl, is_dir=True
+        )
         if win_issue:
             return win_issue
         root_uid = 0
@@ -759,7 +795,9 @@ def inspect_skill_permission_issue(
             if not os.access(current, os.R_OK | os.X_OK):
                 return "目录缺少当前用户读取或遍历权限"
         elif current != skill_dir:
-            win_issue = _check_windows_sddl(_get_windows_sddl(current), root_sddl)
+            win_issue = _check_windows_sddl(
+                _get_windows_sddl(current), root_sddl, is_dir=True
+            )
             if win_issue:
                 return win_issue
         try:
@@ -795,7 +833,9 @@ def inspect_skill_permission_issue(
                                 return f"文件 {entry.name} 缺少读取权限"
                         else:
                             win_issue = _check_windows_sddl(
-                                _get_windows_sddl(entry_path), root_sddl
+                                _get_windows_sddl(entry_path),
+                                root_sddl,
+                                is_dir=False,
                             )
                             if win_issue:
                                 return win_issue

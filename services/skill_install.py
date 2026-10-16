@@ -22,6 +22,8 @@ from ..security.scanner import (
     MAX_TOTAL_BYTES,
     InspectionError,
     ScanReport,
+    _check_windows_sddl,
+    _get_windows_sddl,
     audit_installed_skills,
     inspect_skill_permission_issue,
     load_directory,
@@ -133,8 +135,14 @@ def _normalize_permissions(target: Path, root: Path) -> None:
             issue = inspect_skill_permission_issue(target, root)
             if issue:
                 raise OSError(f"Windows 权限归一化后仍存在异常: {issue}")
-        elif not os.access(target, os.R_OK):
-            raise OSError("Windows 文件权限归一化后仍无法读取。")
+        else:
+            file_issue = _check_windows_sddl(
+                _get_windows_sddl(target), _get_windows_sddl(root), is_dir=False
+            )
+            if file_issue or not os.access(target, os.R_OK):
+                raise OSError(
+                    f"Windows 文件权限归一化后仍存在异常: {file_issue or '缺少读取权限'}"
+                )
         return
 
     try:
@@ -152,7 +160,10 @@ def _normalize_permissions(target: Path, root: Path) -> None:
     dir_bits = (root_mode & 0o777) | 0o700
     file_bits = (dir_bits & 0o666) | 0o600
     exec_bits = file_bits | (dir_bits & 0o111) | 0o100
-    open_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    o_path = getattr(os, "O_PATH", 0)
+    o_nofollow = getattr(os, "O_NOFOLLOW", 0)
+    use_proc_fd = o_path != 0 and Path("/proc/self/fd").is_dir()
+    chmod_nofollow = os.chmod in getattr(os, "supports_follow_symlinks", set())
 
     pending = [target]
     while pending:
@@ -160,26 +171,47 @@ def _normalize_permissions(target: Path, root: Path) -> None:
         info = current.lstat()
         if stat.S_ISLNK(info.st_mode):
             continue
-        fd = os.open(current, open_flags)
-        try:
-            fd_info = os.fstat(fd)
-            if not os.path.samestat(info, fd_info):
+        is_dir = stat.S_ISDIR(info.st_mode)
+        is_reg = stat.S_ISREG(info.st_mode)
+        if not (is_dir or is_reg):
+            continue
+        cur_mode = stat.S_IMODE(info.st_mode)
+        desired_mode = (
+            dir_bits if is_dir else (exec_bits if (cur_mode & 0o111) else file_bits)
+        )
+        if use_proc_fd:
+            fd = os.open(current, o_path | o_nofollow)
+            try:
+                fd_info = os.fstat(fd)
+                if not os.path.samestat(info, fd_info):
+                    raise OSError("权限归一化期间目标发生并发变更。")
+                proc_fd_path = f"/proc/self/fd/{fd}"
+                os.chmod(proc_fd_path, desired_mode)
+                if chown_ids is not None:
+                    try:
+                        os.chown(proc_fd_path, *chown_ids)
+                    except PermissionError:
+                        logger.debug("Could not chown %s", current, exc_info=True)
+            finally:
+                os.close(fd)
+        else:
+            if not os.path.samestat(info, current.lstat()):
                 raise OSError("权限归一化期间目标发生并发变更。")
-            cur_mode = stat.S_IMODE(fd_info.st_mode)
-            if stat.S_ISDIR(fd_info.st_mode):
-                os.fchmod(fd, dir_bits)
-                with os.scandir(current) as children:
-                    for entry in children:
-                        pending.append(Path(entry.path))
-            elif stat.S_ISREG(fd_info.st_mode):
-                os.fchmod(fd, exec_bits if (cur_mode & 0o111) else file_bits)
+            if chmod_nofollow:
+                os.chmod(current, desired_mode, follow_symlinks=False)
+            else:
+                os.chmod(current, desired_mode)
+            if not os.path.samestat(info, current.lstat()):
+                raise OSError("权限归一化期间目标发生并发变更。")
             if chown_ids is not None:
                 try:
-                    os.fchown(fd, *chown_ids)
+                    os.chown(current, *chown_ids, follow_symlinks=False)
                 except PermissionError:
                     logger.debug("Could not chown %s", current, exc_info=True)
-        finally:
-            os.close(fd)
+        if is_dir:
+            with os.scandir(current) as children:
+                for entry in children:
+                    pending.append(Path(entry.path))
 
 
 def _replace_tree(files: dict[str, bytes], target: Path) -> None:
@@ -211,20 +243,39 @@ def _replace_tree(files: dict[str, bytes], target: Path) -> None:
                 logger.warning("Could not clean skill staging directory %s", tmp)
 
 
-def _replace_file(content: bytes, target: Path) -> None:
+def _write_atomic_file(content: bytes, target: Path, mode: int | None = None) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as stream:
         temporary = Path(stream.name)
         try:
             stream.write(content)
             stream.flush()
-            if target.exists():
-                temporary.chmod(target.stat().st_mode & 0o777)
+            if mode is not None:
+                temporary.chmod(mode & 0o777)
+            elif target.exists():
+                temporary.chmod(target.lstat().st_mode & 0o777)
             stream.close()
             os.replace(temporary, target)
-            _normalize_permissions(target, target.parent)
         finally:
             temporary.unlink(missing_ok=True)
+
+
+def _replace_file(content: bytes, target: Path) -> None:
+    existed = target.exists()
+    old_bytes = target.read_bytes() if existed else None
+    old_mode = stat.S_IMODE(target.lstat().st_mode) if existed else None
+    _write_atomic_file(content, target, old_mode)
+    try:
+        _normalize_permissions(target, target.parent)
+    except Exception:
+        try:
+            if old_bytes is not None:
+                _write_atomic_file(old_bytes, target, old_mode)
+            else:
+                target.unlink(missing_ok=True)
+        except OSError:
+            logger.exception("Failed to roll back %s", target)
+        raise
 
 
 class SkillInstallService:
@@ -504,8 +555,26 @@ class SkillInstallService:
                     raise ValueError("等待期间原 Skill 已改变，请重新提交并审查。")
                 writing = True
                 if prepared.operation == "file":
-                    _replace_file(files[prepared.relative], target / prepared.relative)
-                    _normalize_permissions(target, root)
+                    file_target = target / prepared.relative
+                    existed = file_target.exists()
+                    old_bytes = file_target.read_bytes() if existed else None
+                    old_mode = (
+                        stat.S_IMODE(file_target.lstat().st_mode) if existed else None
+                    )
+                    try:
+                        _replace_file(files[prepared.relative], file_target)
+                        _normalize_permissions(target, root)
+                    except Exception:
+                        try:
+                            if old_bytes is not None:
+                                _write_atomic_file(old_bytes, file_target, old_mode)
+                            else:
+                                file_target.unlink(missing_ok=True)
+                        except OSError:
+                            logger.exception(
+                                "Single-file rollback failed for %s", file_target
+                            )
+                        raise
                 else:
                     _replace_tree(files, target)
                 result["data"] = {
