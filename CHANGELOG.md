@@ -2,6 +2,30 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [0.2.6] - 2026-10-17
+
+### Added
+- `/skill ls` 与 `list_skills` 分级展示全局 Skills、插件级 Skills（随插件提供、全局可用、只读）和当前会话工作区 Skills（仅当前会话生效、不可全局加载），并标注所属插件、预置/只读状态与同名覆盖关系。
+- 新增工作区专属 Skill 保护：全局启用、禁用、删除、更新及安装上传在操作前检查同名工作区 Skill，命中即返回 `readonly_skill` 及原因。
+- 插件内置与沙盒预置 Skill 视为只读，更新和删除被拒时说明所属插件。
+- `/skill files` 与 `/skill read` 支持当前会话工作区 Skill；`local` 运行时优先工作区，其余运行时优先全局与插件。
+- 补充插件级/工作区 Skill 分离展示、只读保护与目录越界拒绝的集成测试。
+
+### Changed
+- 服务层日志统一改用 `astrbot.api.logger`。
+- 待投递扫描报告改为通过请求的 `extra_user_content_parts` 注入临时片段，不再改写 `request.prompt`。
+- `list_skills` 结果新增 `global_skills`、`plugin_skills`、`workspace_skills`、`runtime` 与 `workspace_note` 分组字段，`skills` 仍为全量列表。
+- AI 工具描述与 README 明确作用域：启用、禁用与删除仅作用于全局 Skill。
+- `list_skills` 按方法签名决定是否传入 `runtime`，兼容不支持该参数的 AstrBot 版本。
+
+### Fixed
+- 工作区根解析统一经数据库查询并设 3 秒超时，失败回退默认工作区，避免列表与作用域校验阻塞。
+- 测试加载改用隔离的临时 `ASTRBOT_ROOT`，不再依赖真实 AstrBot 环境。
+
+### Security
+- 插件 Skill 目录解析限定在 `plugins_root` 或内置插件目录内，工作区 Skill 目录须位于工作区 `skills` 下且含 `SKILL.md`，符号链接越界即拒绝。
+- 只读与权限错误单独捕获，返回明确的只读或受保护说明，不再回落到通用失败提示。
+
 ## [0.2.5] - 2026-10-17
 
 ### Added
